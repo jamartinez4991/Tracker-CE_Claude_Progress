@@ -1,0 +1,304 @@
+diff --git a/core/interface/projectEditor/fProjEdit.cpp b/core/interface/projectEditor/fProjEdit.cpp
+index da4923f..c2eab0c 100644
+--- a/core/interface/projectEditor/fProjEdit.cpp
++++ b/core/interface/projectEditor/fProjEdit.cpp
+@@ -403,6 +403,10 @@ uint8_t cProjectEditor::loadProjectValues()
+     sampleRecorder.recorderConfig.gainRadio = mtProject.values.gainRadio;
+     sampleRecorder.recorderConfig.monitor = mtProject.values.monitor;
+     sampleRecorder.recorderConfig.radioFreq = mtProject.values.radioFreq;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++    // Runtime-only preference: every project load / new project returns to Stereo.
++    sampleRecorder.recorderConfig.recordMono = false;
++#endif
+     sampleRecorder.recorderConfig.source =
+       mtProject.values.source >= sourceCount ? 0 : mtProject.values.source;
+ 
+diff --git a/core/interface/sampleRecorder/fSampleRec.cpp b/core/interface/sampleRecorder/fSampleRec.cpp
+index 73e63c9..85aec92 100644
+--- a/core/interface/sampleRecorder/fSampleRec.cpp
++++ b/core/interface/sampleRecorder/fSampleRec.cpp
+@@ -72,6 +72,9 @@ static void functActionGain();
+ static void functActionMonitor();
+ static void functActionRecord();
+ static void functActionRadioFreq();
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++static void functActionFormat();
++#endif
+ static void functActionRadioLeft();
+ static void functActionRadioRight();
+ static void functActionGoToMetronomeConfig();
+@@ -521,6 +524,9 @@ void cSampleRecorder::setConfigScreenFunct()
+     ip->setButtonObj(interfaceButton0 + RADIO_COL2, buttonPress, functActionRadioLeft);
+     ip->setButtonObj(interfaceButton0 + RADIO_COL3, buttonPress, functActionRadioRight);
+     // ip->setButtonObj(interfaceButton4, buttonPress, functActionButton4);
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++    ip->setButtonObj(interfaceButton0 + FORMAT_COL, buttonPress, functActionFormat);
++#endif
+     ip->setButtonObj(interfaceButton0 + GAIN_COL, buttonPress, functActionGain);
+     ip->setButtonObj(interfaceButton0 + MONITOR_COL, buttonPress, functActionMonitor);
+     ip->setButtonObj(interfaceButton7, buttonPress, functActionButton7);
+@@ -1443,6 +1449,9 @@ static void functDeleteBackspace(uint8_t state)
+                 {
+                     case 0: SR->setDefaultSource(); break;
+                     case SR->RADIO_COL1: SR->setDefaultRadioFreq(); break;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++                    case SR->FORMAT_COL: SR->setDefaultFormat(); break;
++#endif
+                     case SR->GAIN_COL: SR->setDefaultGain(); break;
+                     case SR->MONITOR_COL: SR->setDefaultMonitorEnable(); break;
+                     default: break;
+@@ -1523,6 +1532,21 @@ static void functPads(uint8_t pad, uint8_t state, int16_t velo)
+     }
+ }
+ 
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++static void functActionFormat()
++{
++    // Same interaction as the Monitor selector: pressing an already-selected list advances it.
++    if (SR->currentScreen == cSampleRecorder::screenTypeConfig &&
++        SR->selectedPlace == SR->FORMAT_COL)
++    {
++        SR->changeFormatSelection(SR->recorderConfig.recordMono ? -1 : 1);
++    }
++
++    SR->selectedPlace = SR->FORMAT_COL;
++    SR->activateLabelsBorder();
++}
++#endif
++
+ static void functActionGain()
+ {
+     SR->selectedPlace = SR->GAIN_COL;
+@@ -1574,7 +1598,13 @@ static void functActionRecord()
+     }
+     else
+     {
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++        // Stereo-capable source: keep both source channels so Recorder::update() averages L+R
++        // into the single destination channel when Mono is selected.
++        config.destinationChannels = SR->recorderConfig.recordMono ? 1 : 2;
++#else
+         config.destinationChannels = 2;
++#endif
+         config.sourceChannels = 2;
+     }
+ #endif
+@@ -2013,6 +2043,11 @@ static void functEncoder(int16_t value)
+             case SR->RADIO_COL1: SR->changeRadioFreqBar(value); break;
+             case SR->RADIO_COL2: break;
+             case SR->RADIO_COL3: break;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++            case SR->FORMAT_COL:
++                SR->changeFormatSelection(interfaceGlobals.invertValForList ? -value : value);
++                break;
++#endif
+             case SR->GAIN_COL: SR->changeGainBar(value); break;
+             case SR->MONITOR_COL:
+             {
+@@ -2088,6 +2123,13 @@ static void functLeft()
+             case SR->LEVEL_COL:
+             case SR->GAIN_COL:
+             {
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++                if (SR->selectedPlace == SR->GAIN_COL)
++                {
++                    SR->selectedPlace = SR->FORMAT_COL; // Format sits between Source/Radio and Gain
++                    break;
++                }
++#endif
+                 if (SR->recorderConfig.source == cSampleRecorder::sourceTypeRadio)
+                     SR->selectedPlace = SR->RADIO_COL1;
+                 else
+@@ -2156,8 +2198,13 @@ static void functRight()
+             {
+                 if (SR->recorderConfig.source == cSampleRecorder::sourceTypeRadio)
+                     SR->selectedPlace = SR->RADIO_COL1;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++                else
++                    SR->selectedPlace = SR->FORMAT_COL;
++#else
+                 else
+                     SR->selectedPlace = SR->GAIN_COL;
++#endif
+                 break;
+             }
+             case SR->GAIN_COL:
+@@ -2168,10 +2215,17 @@ static void functRight()
+                 }
+                 break;
+             }
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++            case SR->RADIO_COL1:
++            case SR->RADIO_COL2:
++            case SR->RADIO_COL3: SR->selectedPlace = SR->FORMAT_COL; break;
++            case SR->FORMAT_COL: SR->selectedPlace = SR->GAIN_COL; break;
++#else
+             case SR->RADIO_COL1:
+             case SR->RADIO_COL2:
+             case SR->RADIO_COL3:
+             case SR->LEVEL_COL: SR->selectedPlace = SR->GAIN_COL; break;
++#endif
+             case SR->MONITOR_COL: break;
+             default: SR->selectedPlace = SR->MONITOR_COL; break;
+         }
+@@ -2231,6 +2285,9 @@ static void functUp()
+             case SR->RADIO_COL1: SR->changeRadioFreqBar(1); break;
+             case SR->RADIO_COL2: break;
+             case SR->RADIO_COL3: break;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++            case SR->FORMAT_COL: SR->changeFormatSelection(-1); break;
++#endif
+             case SR->GAIN_COL: SR->changeGainBar(1); break;
+             case SR->MONITOR_COL: SR->changeMonitorSelection(-1); break;
+             default: break;
+@@ -2273,6 +2330,9 @@ static void functDown()
+             case SR->RADIO_COL1: SR->changeRadioFreqBar(-1); break;
+             case SR->RADIO_COL2: break;
+             case SR->RADIO_COL3: break;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++            case SR->FORMAT_COL: SR->changeFormatSelection(1); break;
++#endif
+             case SR->GAIN_COL: SR->changeGainBar(-1); break;
+             case SR->MONITOR_COL: SR->changeMonitorSelection(1); break;
+         }
+@@ -2578,6 +2638,31 @@ void cSampleRecorder::setDefaultMonitorEnable()
+ 
+     newFileManager.setProjectStructChanged();
+ }
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++// List semantics, like the Monitor selector: index 0 = Stereo, 1 = Mono.
++void cSampleRecorder::changeFormatSelection(int16_t value)
++{
++    int16_t index = (recorderConfig.recordMono ? 1 : 0) + value;
++    if (index < 0)
++        index = 0;
++    if (index > 1)
++        index = 1;
++
++    // Read once when a recording is configured (functActionRecord); cannot alter a recording
++    // in progress.
++    recorderConfig.recordMono = (index == 1);
++    showFormat();
++    display.synchronizeRefresh();
++}
++
++void cSampleRecorder::setDefaultFormat()
++{
++    recorderConfig.recordMono = false;
++    showFormat();
++    display.synchronizeRefresh();
++}
++#endif
++
+ void cSampleRecorder::setDefaultRadioFreq()
+ {
+     if (radio->isinitialized())
+diff --git a/core/interface/sampleRecorder/gSampleRec.cpp b/core/interface/sampleRecorder/gSampleRec.cpp
+index 2193246..0135227 100644
+--- a/core/interface/sampleRecorder/gSampleRec.cpp
++++ b/core/interface/sampleRecorder/gSampleRec.cpp
+@@ -274,7 +274,11 @@ void cSampleRecorder::showDefaultScreen()
+         display.setControlValue(label[LEVEL_COL], 0);
+         display.setControlValue(label[7], 0);
+         display.setControlText(label[0], "Source");
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++        showFormat();
++#else
+         display.setControlText(label[LEVEL_COL], "Level");
++#endif
+         display.setControlText(label[GAIN_COL], "Gain");
+ 
+         display.setControlText(label[7], "Record");
+@@ -571,6 +575,20 @@ void cSampleRecorder::hideRadio()
+     display.refreshControl(bgLabel);
+ }
+ 
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++void cSampleRecorder::showFormat()
++{
++    if (currentScreen != screenTypeConfig)
++    {
++        return;
++    }
++
++    display.setControlText(label[FORMAT_COL], "Format");
++    display.setControlText2(label[FORMAT_COL], recorderConfig.recordMono ? "Mono" : "Stereo");
++    display.refreshControl(label[FORMAT_COL]);
++}
++#endif
++
+ void cSampleRecorder::hideRDS()
+ {
+     display.setControlHide(radioRdsLabel);
+@@ -1016,6 +1034,9 @@ void cSampleRecorder::resizeSpectrum()
+ #ifdef PLATFORM_IMX
+     bool isStereo = (recorderConfig.source != cSampleRecorder::sourceTypeMicHG &&
+                      recorderConfig.source != cSampleRecorder::sourceTypeMicLG);
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++    isStereo = isStereo && !recorderConfig.recordMono;
++#endif
+ #else
+     bool isStereo = false;
+ #endif
+@@ -1040,6 +1061,12 @@ bool cSampleRecorder::isChannelShown(int channel)
+     }
+     else if (channel == 1)
+     {
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++        if (recorderConfig.recordMono)
++        {
++            return false;
++        }
++#endif
+         return (recorderConfig.source != cSampleRecorder::sourceTypeMicHG &&
+                 recorderConfig.source != cSampleRecorder::sourceTypeMicLG);
+     }
+diff --git a/core/interface/sampleRecorder/sampleRecorder.h b/core/interface/sampleRecorder/sampleRecorder.h
+index 1c5e7a0..1086963 100644
+--- a/core/interface/sampleRecorder/sampleRecorder.h
++++ b/core/interface/sampleRecorder/sampleRecorder.h
+@@ -48,6 +48,12 @@ const char monitorNamesLabels[monitorCount][5] = {
+ 
+ constexpr uint8_t undoCount = 5;
+ 
++// MOD_MONO_SAMPLING (see features/mono-sampling): runtime Stereo/Mono recording format.
++// Tracker+ / Mini only; the original Tracker is already mono-only.
++#if defined(MOD_MONO_SAMPLING) && defined(PLATFORM_IMX)
++#define MOD_MONO_SAMPLING_ACTIVE 1
++#endif
++
+ struct strRecorderConfig
+ {
+     uint8_t source;
+@@ -58,6 +64,11 @@ struct strRecorderConfig
+     uint8_t gainUsb;
+     uint8_t monitor;
+     float radioFreq = 87.5;
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++    // Runtime-only. false = Stereo (default), true = Mono. Never serialized; reset in
++    // cProjectEditor::loadProjectValues().
++    bool recordMono = false;
++#endif
+ };
+ 
+ const strRecorderConfig defaultRecorderConfig = { .source = 0,
+@@ -287,6 +298,19 @@ class cSampleRecorder : public ModuleBase
+         MONITOR_COL = 6,
+ #endif
+     };
++#ifdef MOD_MONO_SAMPLING_ACTIVE
++    // The Format control lives on the Level column's bottom button. The level meter above it is
++    // unchanged; only the label beneath it ("Level") becomes "Format / Stereo|Mono". That column is
++    // never used by Radio, so the control is reachable for every source.
++    static constexpr uint8_t FORMAT_COL = LEVEL_COL;
++    bool isFormatSelected() const
++    {
++        return currentScreen == screenTypeConfig && selectedPlace == FORMAT_COL;
++    }
++    void showFormat();
++    void changeFormatSelection(int16_t value);
++    void setDefaultFormat();
++#endif
+     void setCurrentScreenType(screenType screenType);
+ #ifdef PLATFORM_IMX
+     void refreshOutputSource();

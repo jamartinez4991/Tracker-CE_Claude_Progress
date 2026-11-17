@@ -1,0 +1,1183 @@
+diff --git a/core/AudioEngine/AudioVoice.cpp b/core/AudioEngine/AudioVoice.cpp
+index 64549f6..fc824e5 100644
+--- a/core/AudioEngine/AudioVoice.cpp
++++ b/core/AudioEngine/AudioVoice.cpp
+@@ -5,7 +5,13 @@ AudioVoice::AudioVoice()
+ {
+     connections.push_back(new AudioConnection(&memoryPlayer, &bitDepth));
+     connections.push_back(new AudioConnection(&bitDepth, &filter));
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    connections.push_back(new AudioConnection(&filter, &sampleRateReduction));
++    connections.push_back(new AudioConnection(&sampleRateReduction, &djFilter));
++    connections.push_back(new AudioConnection(&djFilter, &amplifier));
++#else
+     connections.push_back(new AudioConnection(&filter, &amplifier));
++#endif
+     connections.push_back(new AudioConnection(&amplifier, &monoToStereo));
+     connections.push_back(new AudioConnection(&amplifier, &rms));
+ }
+@@ -16,7 +22,16 @@ AudioVoice::AudioVoice()
+     {
+         connections.push_back(new AudioConnection(&memoryPlayer[channel], &bitDepth[channel]));
+         connections.push_back(new AudioConnection(&bitDepth[channel], &filter[channel]));
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++        // Paired stereo: channel index == input/output index of the shared processors.
++        connections.push_back(
++          new AudioConnection(&filter[channel], 0, &sampleRateReduction, channel));
++        connections.push_back(
++          new AudioConnection(&sampleRateReduction, channel, &djFilter, channel));
++        connections.push_back(new AudioConnection(&djFilter, channel, &amplifier[channel], 0));
++#else
+         connections.push_back(new AudioConnection(&filter[channel], &amplifier[channel]));
++#endif
+         connections.push_back(new AudioConnection(&amplifier[channel], &panningAmplifier[channel]));
+         connections.push_back(new AudioConnection(&amplifier[channel], &rms[channel]));
+     }
+@@ -95,6 +110,18 @@ AudioAnalyzeRMS* AudioVoice::getRMS(VoiceChannels channel)
+ }
+ #endif
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++AudioSampleRateReduction* AudioVoice::getSampleRateReduction()
++{
++    return &sampleRateReduction;
++}
++
++AudioFilterDJ* AudioVoice::getDjFilter()
++{
++    return &djFilter;
++}
++#endif
++
+ envelopeGenerator* AudioVoice::getEnvelopeGenerator(EnvelopeGeneratorType type)
+ {
+     return &envelope[type];
+diff --git a/core/AudioEngine/AudioVoice.h b/core/AudioEngine/AudioVoice.h
+index 662b71f..f25719c 100644
+--- a/core/AudioEngine/AudioVoice.h
++++ b/core/AudioEngine/AudioVoice.h
+@@ -42,12 +42,29 @@ class AudioVoice
+     AudioAnalyzeRMS* getRMS(VoiceChannels channel);
+ #endif
+     envelopeGenerator* getEnvelopeGenerator(EnvelopeGeneratorType type);
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    // One processor per voice: 1 channel (original Tracker) or paired L/R (i.MX).
++    AudioSampleRateReduction* getSampleRateReduction();
++    AudioFilterDJ* getDjFilter();
++#endif
+ 
+   private:
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#ifdef PLATFORM_IMX
++    static constexpr uint8_t kFxChannels = 2;
++#else
++    static constexpr uint8_t kFxChannels = 1;
++#endif
++#endif
+ #ifndef PLATFORM_IMX
+     AudioPlayMemory memoryPlayer;
+     AudioBitDepth bitDepth;
+     AudioFilterStateVariable filter;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    // Declared (= constructed = updated) in signal order: filter -> SRR -> DJ -> amplifier.
++    AudioSampleRateReduction sampleRateReduction{ kFxChannels };
++    AudioFilterDJ djFilter{ kFxChannels };
++#endif
+     AudioAmplifier amplifier;
+     MonoToStereo monoToStereo;
+     AudioAnalyzeRMS rms;
+@@ -55,6 +72,10 @@ class AudioVoice
+     AudioPlayMemory memoryPlayer[VoiceChannels::kChannelsCount];
+     AudioBitDepth bitDepth[VoiceChannels::kChannelsCount];
+     AudioFilterStateVariable filter[VoiceChannels::kChannelsCount];
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    AudioSampleRateReduction sampleRateReduction{ kFxChannels };
++    AudioFilterDJ djFilter{ kFxChannels };
++#endif
+     AudioAmplifier amplifier[VoiceChannels::kChannelsCount];
+     AudioAmplifier panningAmplifier[VoiceChannels::kChannelsCount];
+     AudioAnalyzeRMS rms[VoiceChannels::kChannelsCount];
+diff --git a/core/AudioEngine/mtAudioEngine.cpp b/core/AudioEngine/mtAudioEngine.cpp
+index 4d59561..b844a52 100644
+--- a/core/AudioEngine/mtAudioEngine.cpp
++++ b/core/AudioEngine/mtAudioEngine.cpp
+@@ -342,16 +342,22 @@ void audioEngine::connectVoiceToMixer(AudioVoice* voice, MixerAndFxs<kVoices>* m
+                           1,
+                           mixerAndFxs->getTracksMixer(MixerAndFxChannelType::kRight),
+                           idx));
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#define SEND_TAP_MONO (voice->getDjFilter())
++#else
++#define SEND_TAP_MONO (voice->getFilter())
++#endif
+     connections.push_back(
+-      new AudioConnection(voice->getFilter(),
++      new AudioConnection(SEND_TAP_MONO,
+                           0,
+                           mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kReverb),
+                           idx));
+     connections.push_back(
+-      new AudioConnection(voice->getFilter(),
++      new AudioConnection(SEND_TAP_MONO,
+                           0,
+                           mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kDelay),
+                           idx));
++#undef SEND_TAP_MONO
+ }
+ #else
+ void audioEngine::connectVoiceToMixer(AudioVoice* voice, MixerAndFxs<kVoices>* mixerAndFxs, int idx)
+@@ -368,27 +374,29 @@ void audioEngine::connectVoiceToMixer(AudioVoice* voice, MixerAndFxs<kVoices>* m
+                           mixerAndFxs->getTracksMixer(MixerAndFxChannelType::kRight),
+                           idx));
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    // Send taps come from the DJ filter's paired outputs (0 = L, 1 = R), i.e. after both new effects.
++#define SEND_TAP_L (voice->getDjFilter()), 0
++#define SEND_TAP_R (voice->getDjFilter()), 1
++#else
++#define SEND_TAP_L (voice->getFilter(AudioVoice::VoiceChannels::kLeft)), 0
++#define SEND_TAP_R (voice->getFilter(AudioVoice::VoiceChannels::kRight)), 0
++#endif
++    connections.push_back(new AudioConnection(
++      SEND_TAP_L, mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kReverb), idx));
+     connections.push_back(
+-      new AudioConnection(voice->getFilter(AudioVoice::VoiceChannels::kLeft),
+-                          0,
+-                          mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kReverb),
+-                          idx));
+-    connections.push_back(
+-      new AudioConnection(voice->getFilter(AudioVoice::VoiceChannels::kRight),
+-                          0,
++      new AudioConnection(SEND_TAP_R,
+                           mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kReverb),
+                           kVoices + kInputsChannels + idx));
+ 
++    connections.push_back(new AudioConnection(
++      SEND_TAP_L, mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kDelay), idx));
+     connections.push_back(
+-      new AudioConnection(voice->getFilter(AudioVoice::VoiceChannels::kLeft),
+-                          0,
+-                          mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kDelay),
+-                          idx));
+-    connections.push_back(
+-      new AudioConnection(voice->getFilter(AudioVoice::VoiceChannels::kRight),
+-                          0,
++      new AudioConnection(SEND_TAP_R,
+                           mixerAndFxs->getPreFxMixer(MixerAndFxs<kVoices>::FxType::kDelay),
+                           kVoices + kInputsChannels + idx));
++#undef SEND_TAP_L
++#undef SEND_TAP_R
+ }
+ #endif
+ 
+@@ -1678,9 +1686,17 @@ playerEngine::playerEngine()
+     playMemPtr.push_back(audioVoice.getMemoryPlayer());
+     filterPtr.push_back(audioVoice.getFilter());
+     bitDepthPtr.push_back(audioVoice.getBitDepth());
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    sampleRateReductionPtr = audioVoice.getSampleRateReduction();
++    djFilterPtr = audioVoice.getDjFilter();
++#endif
+     ampPtr.push_back(audioVoice.getAmplifier());
+     rmsPtr.push_back(audioVoice.getRMS());
+ #else
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    sampleRateReductionPtr = audioVoice.getSampleRateReduction();
++    djFilterPtr = audioVoice.getDjFilter();
++#endif
+     for (int channel = 0; channel < AudioVoice::VoiceChannels::kChannelsCount; channel++)
+     {
+         playMemPtr.push_back(audioVoice.getMemoryPlayer((AudioVoice::VoiceChannels)channel));
+@@ -1822,6 +1838,18 @@ AUDIO_CORE_RAM void playerEngine ::modBitDepth(uint8_t value)
+     }
+ }
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++AUDIO_CORE_RAM void playerEngine ::modSampleRateReduction(uint8_t value)
++{
++    sampleRateReductionPtr->setReduction(value);
++}
++
++AUDIO_CORE_RAM void playerEngine ::modDjFilter(int8_t value)
++{
++    djFilterPtr->setValue(value);
++}
++#endif
++
+ AUDIO_CORE_RAM void playerEngine ::modWavetableWindow(uint16_t value)
+ {
+     for (int channel = 0; channel < (int)playMemPtr.size(); channel++)
+@@ -2141,6 +2169,10 @@ uint8_t playerEngine ::noteOnWithoutInstrument(std::vector<int16_t*> addr,
+     modDelaySend(AMP_MUTED);
+     modReverbSend(AMP_MUTED);
+     modBitDepth(BIT_DEPTH_MAX);
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    modSampleRateReduction(0);
++    modDjFilter(0);
++#endif
+     modOverdrive(OVERDRIVE_DISABLED);
+ 
+     engine.setLimiterAttack(300);
+diff --git a/core/AudioEngine/mtAudioEngine.h b/core/AudioEngine/mtAudioEngine.h
+index 8d04081..033fc54 100644
+--- a/core/AudioEngine/mtAudioEngine.h
++++ b/core/AudioEngine/mtAudioEngine.h
+@@ -302,6 +302,10 @@ class playerEngine
+     void modResonance(float value);
+     void modOverdrive(uint8_t value);
+     void modBitDepth(uint8_t value);
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    void modSampleRateReduction(uint8_t value);
++    void modDjFilter(int8_t value);
++#endif
+ 
+     void modSeqPoints(uint32_t sp, uint32_t ep, uint8_t fx_n);
+ 
+@@ -594,6 +598,13 @@ class playerEngine
+     std::vector<AudioAmplifier*> ampPtr;
+     std::vector<AudioFilterStateVariable*> filterPtr;
+     std::vector<AudioBitDepth*> bitDepthPtr;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    AudioSampleRateReduction* sampleRateReductionPtr = nullptr; // one per voice (paired on i.MX)
++    AudioFilterDJ* djFilterPtr = nullptr;
++    inline void handleUpdateRefreshSampleRateReduction();
++    inline void handleUpdateRefreshDjFilter();
++    void handleNoteOnInstrumentFx();
++#endif
+     std::vector<AudioAnalyzeRMS*> rmsPtr;
+ 
+     envelopeGenerator* envelopePtr[envMax];
+diff --git a/core/AudioEngine/mtAudioNoteOnHandle.cpp b/core/AudioEngine/mtAudioNoteOnHandle.cpp
+index fa987b3..0636520 100644
+--- a/core/AudioEngine/mtAudioNoteOnHandle.cpp
++++ b/core/AudioEngine/mtAudioNoteOnHandle.cpp
+@@ -39,6 +39,9 @@ uint8_t playerEngine ::noteOn(uint8_t instr_idx, int8_t note, int8_t _velocity)
+     handleNoteOnReverbSend();
+ 
+     handleNoteOnBitCrusher();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    handleNoteOnInstrumentFx();
++#endif
+ 
+     status = 1; // playMemPtr->play(instr_idx,note);
+     if (isTrackDisplayed)
+@@ -102,6 +105,9 @@ AUDIO_CORE_RAM uint8_t playerEngine ::noteOn(uint8_t instr_idx,
+     handleFxNoteOnPanning();
+ 
+     handleFxNoteOnBitDepth();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    handleNoteOnInstrumentFx();
++#endif
+ 
+     handleFxNoteOnDelaySend();
+ 
+@@ -482,6 +488,18 @@ void playerEngine::handleNoteOnBitCrusher()
+     modBitDepth(mtProject.instrument[currentInstrument_idx].bitDepth);
+ }
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++// Static instrument parameters: applied for every new note so voice reuse never keeps the previous
++// instrument's settings. Phase / held samples / filter state restart deterministically.
++void playerEngine::handleNoteOnInstrumentFx()
++{
++    sampleRateReductionPtr->reset();
++    djFilterPtr->reset();
++    modSampleRateReduction(mtProject.instrument[currentInstrument_idx].sampleRateReduction);
++    modDjFilter(mtProject.instrument[currentInstrument_idx].djFilter);
++}
++#endif
++
+ AUDIO_CORE_RAM void playerEngine::handleNoteOnDelaySend()
+ {
+     assert(playMemPtr[0] != nullptr);
+diff --git a/core/AudioEngine/mtAudioUpdateHandle.cpp b/core/AudioEngine/mtAudioUpdateHandle.cpp
+index de0b5d6..88b3bd4 100644
+--- a/core/AudioEngine/mtAudioUpdateHandle.cpp
++++ b/core/AudioEngine/mtAudioUpdateHandle.cpp
+@@ -59,6 +59,10 @@ AUDIO_CORE_RAM void playerEngine::update()
+         handleUpdateRefreshReverb();
+         handleUpdateRefreshOverdrive();
+         handleUpdateRefreshBitDepth();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++        handleUpdateRefreshSampleRateReduction();
++        handleUpdateRefreshDjFilter();
++#endif
+         handleUpdateRefreshGranLen();
+         handleUpdateRefreshGranWave();
+         handleUpdateRefreshGranLoop();
+@@ -539,6 +543,27 @@ inline void playerEngine::handleUpdateRefreshBitDepth()
+     }
+ }
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++// Static instrument parameters: no performance-mode / sequencer-modulation override paths.
++inline void playerEngine::handleUpdateRefreshSampleRateReduction()
++{
++    if (refreshRegister & SAMPLE_RATE_REDUCTION_MASK)
++    {
++        refreshRegister &= (~SAMPLE_RATE_REDUCTION_MASK);
++        modSampleRateReduction(mtProject.instrument[currentInstrument_idx].sampleRateReduction);
++    }
++}
++
++inline void playerEngine::handleUpdateRefreshDjFilter()
++{
++    if (refreshRegister & DJ_FILTER_MASK)
++    {
++        refreshRegister &= (~DJ_FILTER_MASK);
++        modDjFilter(mtProject.instrument[currentInstrument_idx].djFilter);
++    }
++}
++#endif
++
+ inline void playerEngine::handleUpdateRefreshWtPos()
+ {
+     if (refreshRegister & WT_POS_SEND_MASK)
+diff --git a/core/FileManager/fileManagerInstrument.cpp b/core/FileManager/fileManagerInstrument.cpp
+index efec82b..f687767 100644
+--- a/core/FileManager/fileManagerInstrument.cpp
++++ b/core/FileManager/fileManagerInstrument.cpp
+@@ -923,6 +923,13 @@ void cFileManager::setDefaultActiveInstrument(struct strInstrument* targetInstru
+     targetInstrument->overdrive = 0;
+     targetInstrument->bitDepth = 16;
+     targetInstrument->tuneResample = 0;
++#ifdef MOD_INSTRUMENT_EXT
++    targetInstrument->sampleRateReduction = 0;
++    targetInstrument->djFilter = 0;
++    targetInstrument->pitchModSemitones = 0;
++    targetInstrument->pitchModCents = 100; // legacy +-1 semitone pitch modulation depth
++    targetInstrument->lfoPolarityMask = 0; // all LFOs Bipolar
++#endif
+ 
+     targetInstrument->granular.grainLength = 441;
+ 
+diff --git a/core/FileManager/mtFileManagerOldVersionRecovery.cpp b/core/FileManager/mtFileManagerOldVersionRecovery.cpp
+index 7654f32..2dcd742 100644
+--- a/core/FileManager/mtFileManagerOldVersionRecovery.cpp
++++ b/core/FileManager/mtFileManagerOldVersionRecovery.cpp
+@@ -34,6 +34,9 @@ static void recoveryInstrumentVersion5();
+ static void recoveryInstrumentVersion6();
+ static void recoveryInstrumentVersion7();
+ static void recoveryInstrumentVersion8();
++#ifdef MOD_INSTRUMENT_EXT
++static void recoveryInstrumentVersion9();
++#endif
+ 
+ mtVersionRecovery versionRecovery;
+ 
+@@ -68,6 +71,9 @@ mtVersionRecovery::mtVersionRecovery()
+     recoveryInstrumentFunction[5] = recoveryInstrumentVersion6;
+     recoveryInstrumentFunction[6] = recoveryInstrumentVersion7;
+     recoveryInstrumentFunction[7] = recoveryInstrumentVersion8;
++#ifdef MOD_INSTRUMENT_EXT
++    recoveryInstrumentFunction[8] = recoveryInstrumentVersion9;
++#endif
+ }
+ // zwraca wskaznik do aktywnego odczytanego projektu
+ strMtProjectRemote* mtVersionRecovery::getReadedProject()
+@@ -470,3 +476,21 @@ static void recoveryInstrumentVersion8()
+       volumeConverter.convertInstrumentVolumeVersion1300to1302(
+         receivedInstrument->instrumentDataAndHeader.instrument.volume);
+ }
++
++#ifdef MOD_INSTRUMENT_EXT
++// v9 -> v10: the shared mod extension block was appended. Set legacy/neutral values explicitly
++// (do not rely on the loader's zero-fill alone): pitchModCents = 100 keeps the stock +-1 semitone
++// pitch modulation depth, polarity mask 0 = every LFO Bipolar.
++static void recoveryInstrumentVersion9()
++{
++    strInstrumentFile* receivedInstrument = versionRecovery.getReadedInstrument();
++    strInstrument& instr = receivedInstrument->instrumentDataAndHeader.instrument;
++
++    instr.sampleRateReduction = 0;
++    instr.djFilter = 0;
++    instr.pitchModSemitones = 0;
++    instr.pitchModCents = 100;
++    instr.lfoPolarityMask = 0;
++    instr.modExtReserved[0] = instr.modExtReserved[1] = instr.modExtReserved[2] = 0;
++}
++#endif
+diff --git a/core/interface/instrumentEditor/fIinstrEdit.cpp b/core/interface/instrumentEditor/fIinstrEdit.cpp
+index 3e96835..94f08fe 100644
+--- a/core/interface/instrumentEditor/fIinstrEdit.cpp
++++ b/core/interface/instrumentEditor/fIinstrEdit.cpp
+@@ -57,6 +57,10 @@ static void functEffectSelectReverb();
+ static void functEffectSelectDelay();
+ static void functEffectSelectOverdrive();
+ static void functEffectSelectBitDepth();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++static void functEffectSelectSampleRate();
++static void functEffectSelectDjFilter();
++#endif
+ static void functOpenInstrumentSynthesizer();
+ static void functEffectBack();
+ 
+@@ -428,6 +432,10 @@ void cInstrumentEditor::setEffectScreenFunct()
+     ip->setButtonObj(interfaceButton2, buttonPress, functEffectSelectReverb);
+     ip->setButtonObj(interfaceButton3, buttonPress, functEffectSelectDelay);
+     ip->setButtonObj(interfaceButton4, buttonPress, functOpenInstrumentSynthesizer);
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    ip->setButtonObj(interfaceButton5, buttonPress, functEffectSelectSampleRate);
++    ip->setButtonObj(interfaceButton6, buttonPress, functEffectSelectDjFilter);
++#endif
+ 
+     ip->setButtonObj(interfaceButton7, buttonPress, functEffectBack);
+ }
+@@ -444,6 +452,10 @@ void cInstrumentEditor::changeParamValue(int value, ValueChangeSource source)
+             case 1: cInstrumentEditor::changeParamsBitDepth(value); break;
+             case 2: cInstrumentEditor::changeParamsReverbSend(value); break;
+             case 3: cInstrumentEditor::changeParamsDelaySend(value); break;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++            case 5: cInstrumentEditor::changeParamsSampleRate(value); break;
++            case 6: cInstrumentEditor::changeParamsDjFilter(value); break;
++#endif
+             default: break;
+         }
+         return;
+@@ -840,6 +852,10 @@ static void functLeft()
+     {
+         if (IE->selectedPlaceSends > 0)
+             IE->selectedPlaceSends--;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++        if (IE->selectedPlaceSends == 4) // slot 4 is a button-only entry (Instrument / MIDI Mapping)
++            IE->selectedPlaceSends = 3;
++#endif
+         IE->showSendScreenFrame();
+         return;
+     }
+@@ -872,6 +888,10 @@ static void functRight()
+     {
+         if (IE->selectedPlaceSends < IE->frameData.placesCount - 1)
+             IE->selectedPlaceSends++;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++        if (IE->selectedPlaceSends == 4)
++            IE->selectedPlaceSends = 5;
++#endif
+ 
+         IE->showSendScreenFrame();
+         return;
+@@ -958,6 +978,10 @@ static void functDelete(uint8_t state)
+                 case 1: IE->setDefaultBitDepth(); break;
+                 case 2: IE->setDefaultReverbSend(); break;
+                 case 3: IE->setDefaultDelaySend(); break;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++                case 5: IE->setDefaultSampleRate(); break;
++                case 6: IE->setDefaultDjFilter(); break;
++#endif
+             }
+ 
+             return;
+@@ -2051,6 +2075,71 @@ void cInstrumentEditor::changeParamsBitDepth(int16_t value)
+         IE->showParamsBitDepth();
+ }
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++// Static instrument parameters: refresh bits push the new value to active voices; no modulation.
++void cInstrumentEditor::changeParamsSampleRate(int16_t value)
++{
++    const int next = (int)IE->editorInstrument->sampleRateReduction + value;
++    IE->editorInstrument->sampleRateReduction = (uint8_t)(next < 0 ? 0 : (next > 255 ? 255 : next));
++
++    for (uint8_t i = 0; i < 8; i++)
++    {
++        instrumentPlayer[i].setRefreshBit(SAMPLE_RATE_REDUCTION_MASK);
++    }
++
++    newFileManager.setInstrumentStructChanged(mtProject.values.lastUsedInstrument);
++
++    bool isParamVisible = mtInterface.isInstrumentParamsScreenActive() &&
++                          (IE->mode == mtInstrumentEditorMode::mtInstEditModeParams) &&
++                          IE->isEffectsWindow;
++
++    if (isParamVisible)
++        IE->showParamsSampleRate();
++}
++
++void cInstrumentEditor::changeParamsDjFilter(int16_t value)
++{
++    const int next = (int)IE->editorInstrument->djFilter + value;
++    IE->editorInstrument->djFilter = (int8_t)(next < -100 ? -100 : (next > 100 ? 100 : next));
++
++    for (uint8_t i = 0; i < 8; i++)
++    {
++        instrumentPlayer[i].setRefreshBit(DJ_FILTER_MASK);
++    }
++
++    newFileManager.setInstrumentStructChanged(mtProject.values.lastUsedInstrument);
++
++    bool isParamVisible = mtInterface.isInstrumentParamsScreenActive() &&
++                          (IE->mode == mtInstrumentEditorMode::mtInstEditModeParams) &&
++                          IE->isEffectsWindow;
++
++    if (isParamVisible)
++        IE->showParamsDjFilter();
++}
++
++void cInstrumentEditor::setDefaultSampleRate()
++{
++    IE->editorInstrument->sampleRateReduction = 0;
++    for (uint8_t i = 0; i < 8; i++)
++    {
++        instrumentPlayer[i].setRefreshBit(SAMPLE_RATE_REDUCTION_MASK);
++    }
++    newFileManager.setInstrumentStructChanged(mtProject.values.lastUsedInstrument);
++    IE->showParamsSampleRate();
++}
++
++void cInstrumentEditor::setDefaultDjFilter()
++{
++    IE->editorInstrument->djFilter = 0;
++    for (uint8_t i = 0; i < 8; i++)
++    {
++        instrumentPlayer[i].setRefreshBit(DJ_FILTER_MASK);
++    }
++    newFileManager.setInstrumentStructChanged(mtProject.values.lastUsedInstrument);
++    IE->showParamsDjFilter();
++}
++#endif
++
+ void changeParamsVelocity(int16_t value)
+ {
+     uint8_t* temp_velocity =
+@@ -3151,6 +3240,20 @@ static void functEffectSelectBitDepth()
+     IE->showSendScreenFrame();
+ }
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++static void functEffectSelectSampleRate()
++{
++    IE->selectedPlaceSends = 5;
++    IE->showSendScreenFrame();
++}
++
++static void functEffectSelectDjFilter()
++{
++    IE->selectedPlaceSends = 6;
++    IE->showSendScreenFrame();
++}
++#endif
++
+ static void functOpenInstrumentSynthesizer()
+ {
+     IE->isEffectsWindow = false;
+diff --git a/core/interface/instrumentEditor/gInstrEdit.cpp b/core/interface/instrumentEditor/gInstrEdit.cpp
+index daec493..2609ae7 100644
+--- a/core/interface/instrumentEditor/gInstrEdit.cpp
++++ b/core/interface/instrumentEditor/gInstrEdit.cpp
+@@ -3,6 +3,9 @@
+ #include "mtWavetableEnvelopes.h"
+ #include "fileManager.h"
+ #include <stdio.h>
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#include "effect_sampleRateReduction.h"
++#endif
+ 
+ #include "core/interfacePopups.h"
+ #include "polyassert.h"
+@@ -677,7 +680,11 @@ void cInstrumentEditor::showEffectScreen()
+ {
+     showTitleBar();
+     showSendScreenFrame();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    frameData.placesCount = 7; // slots 0-3 effects, 4 (button only, skipped), 5-6 new effects
++#else
+     frameData.placesCount = 4;
++#endif
+ 
+     for (uint8_t i = 0; i < 8; i++)
+     {
+@@ -711,8 +718,19 @@ void cInstrumentEditor::showEffectScreen()
+     display.setControlShow(barControl[2]);
+     display.setControlShow(barControl[3]);
+     display.setControlHide(filterModeListControl);
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    display.setControlStyle(barControl[5],
++                            (controlStyleShow | controlStyleValue_0_100 | controlStyleBackground) |
++                              shadow | gradient);
++    display.setControlStyle(barControl[6],
++                            (controlStyleShow | controlStyleValue_0_100 | controlStyleBackground) |
++                              shadow | gradient);
++    display.setControlShow(barControl[5]);
++    display.setControlShow(barControl[6]);
++#else
+     display.setControlHide(barControl[5]);
+     display.setControlHide(barControl[6]);
++#endif
+ 
+     display.setControlText(label[0], "Overdrive");
+     display.setControlText(label[1], "Bit depth");
+@@ -721,11 +739,16 @@ void cInstrumentEditor::showEffectScreen()
+     display.setControlText(label[4], "Instrument");
+     display.setControlText2(label[4], "MIDI Mapping");
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    display.setControlText(label[5], "Sample rate");
++    display.setControlText(label[6], "DJ filter");
++#else
+     for (uint8_t i = 5; i < 7; i++)
+     {
+         display.setControlText(label[i], "");
+         display.setControlText2(label[i], "");
+     }
++#endif
+     display.setControlText(label[7], "Back");
+     display.setControlText2(label[7], "");
+ 
+@@ -737,6 +760,10 @@ void cInstrumentEditor::showEffectScreen()
+     showParamsReverbSend();
+     showParamsOverdrive();
+     showParamsBitDepth();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    showParamsSampleRate();
++    showParamsDjFilter();
++#endif
+ 
+     display.setRemoveControlStyle(label[1], controlStyleShowBitmap);
+     display.setRemoveControlStyle(label[6], controlStyleShowBitmap);
+@@ -780,8 +807,13 @@ void cInstrumentEditor::showEffectScreen()
+ 
+ void cInstrumentEditor::showSendScreenFrame()
+ {
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    if (selectedPlaceSends == 4 || selectedPlaceSends > 6)
++        return;
++#else
+     if (selectedPlaceSends > 3)
+         return;
++#endif
+ 
+     display.setControlValue(frameControl, selectedPlaceSends);
+     display.setControlShow(frameControl);
+@@ -1746,6 +1778,46 @@ void cInstrumentEditor::showParamsBitDepth()
+     display.refreshControl(barControl[1]);
+ }
+ 
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++void cInstrumentEditor::showParamsSampleRate()
++{
++    const uint8_t v = editorInstrument->sampleRateReduction;
++    if (v == 0)
++    {
++        sprintf(labelText[5], "Off");
++    }
++    else
++    {
++        const int hz = (int)(AudioSampleRateReduction::effectiveRateHz(v) + 0.5f);
++        if (hz >= 10000)
++            sprintf(labelText[5], "%d.%dk", hz / 1000, (hz % 1000) / 100);
++        else
++            sprintf(labelText[5], "%d Hz", hz);
++    }
++    display.setControlText2(label[5], labelText[5]);
++    display.refreshControl(label[5]);
++
++    display.setControlValue(barControl[5], (int)v * 100 / 255);
++    display.refreshControl(barControl[5]);
++}
++
++void cInstrumentEditor::showParamsDjFilter()
++{
++    const int8_t v = editorInstrument->djFilter;
++    if (v == 0)
++        sprintf(labelText[6], "Off");
++    else if (v < 0)
++        sprintf(labelText[6], "LP %d", -(int)v);
++    else
++        sprintf(labelText[6], "HP %d", (int)v);
++    display.setControlText2(label[6], labelText[6]);
++    display.refreshControl(label[6]);
++
++    display.setControlValue(barControl[6], ((int)v + 100) / 2);
++    display.refreshControl(barControl[6]);
++}
++#endif
++
+ void cInstrumentEditor::refreshFramePosition()
+ {
+     switch (mode)
+diff --git a/core/interface/instrumentEditor/instrumentEditor.h b/core/interface/instrumentEditor/instrumentEditor.h
+index fd18e82..9996c80 100644
+--- a/core/interface/instrumentEditor/instrumentEditor.h
++++ b/core/interface/instrumentEditor/instrumentEditor.h
+@@ -239,6 +239,10 @@ class cInstrumentEditor : public ModuleBase
+     void showParamsReverbSend();
+     void showParamsOverdrive();
+     void showParamsBitDepth();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    void showParamsSampleRate();
++    void showParamsDjFilter();
++#endif
+ 
+     static void changeParamsVolume(int16_t value);
+     static void changeParamsPanning(int16_t value);
+@@ -251,6 +255,10 @@ class cInstrumentEditor : public ModuleBase
+     static void changeParamsReverbSend(int16_t value);
+     static void changeParamsOverdrive(int16_t value);
+     static void changeParamsBitDepth(int16_t value);
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    static void changeParamsSampleRate(int16_t value);
++    static void changeParamsDjFilter(int16_t value);
++#endif
+ 
+     void setDefaultVolume();
+     void setDefaultPanning();
+@@ -263,6 +271,10 @@ class cInstrumentEditor : public ModuleBase
+     void setDefaultReverbSend();
+     void setDefaultOverdrive();
+     void setDefaultBitDepth();
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++    void setDefaultSampleRate();
++    void setDefaultDjFilter();
++#endif
+ 
+     //----------------------------------
+     // envelopes lists
+diff --git a/core/libs/Audio/Audio.h b/core/libs/Audio/Audio.h
+index 9bc0f43..2f3da9f 100644
+--- a/core/libs/Audio/Audio.h
++++ b/core/libs/Audio/Audio.h
+@@ -51,6 +51,10 @@
+ #include "amplifier.h"
+ #include "analyze_rms.h"
+ #include "effect_bitDepth.h"
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#include "effect_sampleRateReduction.h"
++#include "filter_dj.h"
++#endif
+ #include "effect_dynamics.h"
+ #include "effect_limiter.h"
+ #include "effect_polyverb.h"
+diff --git a/core/libs/Audio/effect_sampleRateReduction.cpp b/core/libs/Audio/effect_sampleRateReduction.cpp
+new file mode 100644
+index 0000000..65f57b9
+--- /dev/null
++++ b/core/libs/Audio/effect_sampleRateReduction.cpp
+@@ -0,0 +1,95 @@
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#include "effect_sampleRateReduction.h"
++#include <math.h>
++
++float AudioSampleRateReduction::effectiveRateHz(uint8_t value)
++{
++    const float x = (float)value / 255.0f;
++    return kMaxRateHz * expf(x * x * logf(kMinRateHz / kMaxRateHz));
++}
++
++AUDIO_CORE_FLASH void AudioSampleRateReduction::setReduction(uint8_t value)
++{
++    uint32_t inc = 0;
++    if (value != 0)
++    {
++        // ratio = effective rate / output rate, strictly < 1 for value > 0.
++        const float ratio = effectiveRateHz(value) / kMaxRateHz;
++        const float scaled = ratio * 4294967296.0f;
++        inc = scaled >= 4294967040.0f ? 0xFFFFFF00u : (uint32_t)scaled;
++        if (inc == 0)
++            inc = 1;
++    }
++    if (phaseIncrement == 0 && inc != 0)
++        captureNext = true; // leaving bypass: never output stale held data
++    phaseIncrement = inc;   // phase is deliberately preserved
++}
++
++AUDIO_CORE_FLASH void AudioSampleRateReduction::reset()
++{
++    phase = 0;
++    captureNext = true;
++    held[0] = 0;
++    held[1] = 0;
++}
++
++AUDIO_CORE_RAM void AudioSampleRateReduction::update(void)
++{
++    audio_block_t* in[kMaxChannels] = { nullptr, nullptr };
++    bool complete = true;
++
++    for (uint8_t ch = 0; ch < channels; ch++)
++    {
++        in[ch] = (phaseIncrement == 0) ? receiveReadOnly(ch) : receiveWritable(ch);
++        if (!in[ch])
++            complete = false;
++    }
++
++    if (!complete)
++    {
++        // Paired processing needs both blocks: drop the partner, advance no state.
++        for (uint8_t ch = 0; ch < channels; ch++)
++        {
++            if (in[ch])
++                release(in[ch]);
++        }
++        return;
++    }
++
++    if (phaseIncrement != 0)
++    {
++        uint32_t ph = phase;
++        const uint32_t inc = phaseIncrement;
++        bool first = captureNext;
++        int16_t h0 = held[0];
++        int16_t h1 = held[1];
++
++        for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
++        {
++            const uint32_t prev = ph;
++            ph += inc;
++            if (first || ph < prev) // wrap = capture event, shared by both channels
++            {
++                h0 = in[0]->data[i];
++                if (channels == 2)
++                    h1 = in[1]->data[i];
++                first = false;
++            }
++            in[0]->data[i] = h0;
++            if (channels == 2)
++                in[1]->data[i] = h1;
++        }
++
++        phase = ph;
++        captureNext = first;
++        held[0] = h0;
++        held[1] = h1;
++    }
++
++    for (uint8_t ch = 0; ch < channels; ch++)
++    {
++        transmit(in[ch], ch);
++        release(in[ch]);
++    }
++}
++#endif /* MOD_SAMPLE_INSTRUMENT_FX */
+diff --git a/core/libs/Audio/effect_sampleRateReduction.h b/core/libs/Audio/effect_sampleRateReduction.h
+new file mode 100644
+index 0000000..173557d
+--- /dev/null
++++ b/core/libs/Audio/effect_sampleRateReduction.h
+@@ -0,0 +1,47 @@
++// MOD_SAMPLE_INSTRUMENT_FX - Sample-Rate Reduction (see features/sample-instrument-fx)
++//
++// Sample-and-hold decimator. Captures the input at a reduced effective rate and holds each captured
++// value until the next capture event. No interpolation and no anti-alias filter (aliasing is the
++// intended sound). The engine's real output rate, pitch, speed and duration are untouched.
++//
++// One instance serves a whole voice: 1 channel on the original Tracker, 2 channels (L/R) on i.MX.
++// Both channels share ONE phase accumulator (capture events are simultaneous); only the held values
++// are per channel.
++#ifndef LIBS_AUDIO_EFFECT_SAMPLERATEREDUCTION_H_
++#define LIBS_AUDIO_EFFECT_SAMPLERATEREDUCTION_H_
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#include "AudioStream.h"
++
++class AudioSampleRateReduction : public AudioStream
++{
++  public:
++    static constexpr uint8_t kMaxChannels = 2;
++    static constexpr float kMaxRateHz = AUDIO_SAMPLE_RATE_EXACT; // parameter 0 (bypass)
++    static constexpr float kMinRateHz = 100.0f;                  // parameter 255
++
++    explicit AudioSampleRateReduction(uint8_t channelCount)
++      : AudioStream(channelCount, inputQueueArray)
++      , channels(channelCount)
++    {
++    }
++    virtual void update(void);
++
++    // 0 = exact bypass, 255 = 100 Hz. Does not reset the sampling phase.
++    void setReduction(uint8_t value);
++    // Deterministic voice-start state: first sample is captured, no stale held data.
++    void reset();
++
++    // Effective sampling frequency for a parameter value: fmax * (fmin/fmax)^(x^2), x = value/255.
++    static float effectiveRateHz(uint8_t value);
++
++  private:
++    audio_block_t* inputQueueArray[kMaxChannels];
++    const uint8_t channels;
++    uint32_t phaseIncrement = 0; // Q0.32 fraction of an output sample per capture; 0 = bypass
++    uint32_t phase = 0;
++    bool captureNext = true;
++    int16_t held[kMaxChannels] = { 0, 0 };
++};
++
++#endif /* MOD_SAMPLE_INSTRUMENT_FX */
++#endif /* LIBS_AUDIO_EFFECT_SAMPLERATEREDUCTION_H_ */
+diff --git a/core/libs/Audio/filter_dj.cpp b/core/libs/Audio/filter_dj.cpp
+new file mode 100644
+index 0000000..f47f71b
+--- /dev/null
++++ b/core/libs/Audio/filter_dj.cpp
+@@ -0,0 +1,136 @@
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#include "filter_dj.h"
++#include <math.h>
++
++float AudioFilterDJ::cutoffHz(int8_t value)
++{
++    const float t = (float)(value < 0 ? -(int)value : (int)value) / 100.0f; // 0..1
++    const float ratio = kMaxCutoffHz / kMinCutoffHz;                        // 1000
++    if (value < 0)
++        return kMaxCutoffHz * powf(1.0f / ratio, t); // 20 kHz -> 20 Hz
++    return kMinCutoffHz * powf(ratio, t);            // 20 Hz  -> 20 kHz
++}
++
++AUDIO_CORE_FLASH void AudioFilterDJ::reset()
++{
++    for (uint8_t ch = 0; ch < kMaxChannels; ch++)
++    {
++        z1[ch] = 0.0f;
++        z2[ch] = 0.0f;
++    }
++}
++
++AUDIO_CORE_FLASH void AudioFilterDJ::setValue(int8_t value)
++{
++    if (value > 100)
++        value = 100;
++    if (value < -100)
++        value = -100;
++
++    if (value == 0)
++    {
++        active = false;
++        return;
++    }
++
++    // Keep the cutoff safely below Nyquist so the bilinear prewarp stays well conditioned.
++    float fc = cutoffHz(value);
++    const float fcLimit = 0.49f * AUDIO_SAMPLE_RATE_EXACT;
++    if (fc > fcLimit)
++        fc = fcLimit;
++
++    const float w0 = 2.0f * (float)M_PI * fc / AUDIO_SAMPLE_RATE_EXACT;
++    const float cosw = cosf(w0);
++    const float alpha = sinf(w0) * 0.70710678f; // sin(w0) / (2Q), Q = 1/sqrt(2): Butterworth
++
++    float nb0, nb1, nb2;
++    if (value < 0) // low-pass
++    {
++        nb0 = (1.0f - cosw) * 0.5f;
++        nb1 = 1.0f - cosw;
++        nb2 = nb0;
++    }
++    else // high-pass
++    {
++        nb0 = (1.0f + cosw) * 0.5f;
++        nb1 = -(1.0f + cosw);
++        nb2 = nb0;
++    }
++    const float a0 = 1.0f + alpha;
++    const float na1 = -2.0f * cosw;
++    const float na2 = 1.0f - alpha;
++
++    if (!(a0 > 0.0f) || !isfinite(nb0) || !isfinite(na1) || !isfinite(na2)) // invalid -> bypass
++    {
++        active = false;
++        return;
++    }
++
++    const bool wasActive = active;
++    const float inv = 1.0f / a0;
++    b0 = nb0 * inv;
++    b1 = nb1 * inv;
++    b2 = nb2 * inv;
++    a1 = na1 * inv;
++    a2 = na2 * inv;
++    if (!wasActive)
++        reset(); // leaving bypass: start from silence, no stale state
++    active = true;
++}
++
++AUDIO_CORE_RAM void AudioFilterDJ::update(void)
++{
++    audio_block_t* in[kMaxChannels] = { nullptr, nullptr };
++    bool complete = true;
++    const bool process = active;
++
++    for (uint8_t ch = 0; ch < channels; ch++)
++    {
++        in[ch] = process ? receiveWritable(ch) : receiveReadOnly(ch);
++        if (!in[ch])
++            complete = false;
++    }
++
++    if (!complete)
++    {
++        for (uint8_t ch = 0; ch < channels; ch++)
++        {
++            if (in[ch])
++                release(in[ch]);
++        }
++        return;
++    }
++
++    if (process)
++    {
++        const float cb0 = b0, cb1 = b1, cb2 = b2, ca1 = a1, ca2 = a2;
++        for (uint8_t ch = 0; ch < channels; ch++)
++        {
++            float s1 = z1[ch];
++            float s2 = z2[ch];
++            int16_t* d = in[ch]->data;
++            for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
++            {
++                const float x = (float)d[i];
++                const float y = cb0 * x + s1;
++                s1 = cb1 * x - ca1 * y + s2;
++                s2 = cb2 * x - ca2 * y;
++                float o = y;
++                if (o > 32767.0f)
++                    o = 32767.0f;
++                else if (o < -32768.0f)
++                    o = -32768.0f;
++                d[i] = (int16_t)o;
++            }
++            z1[ch] = s1;
++            z2[ch] = s2;
++        }
++    }
++
++    for (uint8_t ch = 0; ch < channels; ch++)
++    {
++        transmit(in[ch], ch);
++        release(in[ch]);
++    }
++}
++#endif /* MOD_SAMPLE_INSTRUMENT_FX */
+diff --git a/core/libs/Audio/filter_dj.h b/core/libs/Audio/filter_dj.h
+new file mode 100644
+index 0000000..1c1b67f
+--- /dev/null
++++ b/core/libs/Audio/filter_dj.h
+@@ -0,0 +1,44 @@
++// MOD_SAMPLE_INSTRUMENT_FX - DJ Filter (see features/sample-instrument-fx)
++//
++// Bipolar, non-resonant 2-pole (12 dB/oct) Butterworth biquad.
++//   value  -100 .. -1 : low-pass,  cutoff 20 kHz (at -1) .. 20 Hz (at -100), logarithmic
++//   value  0          : exact bypass (block passed through untouched, no filter state touched)
++//   value  +1 .. +100 : high-pass, cutoff 20 Hz (at +1) .. 20 kHz (at +100), logarithmic
++// One instance serves a whole voice: 1 channel (original Tracker) or 2 (i.MX L/R). Coefficients are
++// shared, state is per channel.
++#ifndef LIBS_AUDIO_FILTER_DJ_H_
++#define LIBS_AUDIO_FILTER_DJ_H_
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++#include "AudioStream.h"
++
++class AudioFilterDJ : public AudioStream
++{
++  public:
++    static constexpr uint8_t kMaxChannels = 2;
++    static constexpr float kMinCutoffHz = 20.0f;
++    static constexpr float kMaxCutoffHz = 20000.0f;
++
++    explicit AudioFilterDJ(uint8_t channelCount)
++      : AudioStream(channelCount, inputQueueArray)
++      , channels(channelCount)
++    {
++    }
++    virtual void update(void);
++
++    void setValue(int8_t value); // clamps to -100..100; recalculates coefficients here, not per sample
++    void reset();                // clears filter state
++
++    // Cutoff in Hz for a non-zero value (LP for <0, HP for >0).
++    static float cutoffHz(int8_t value);
++
++  private:
++    audio_block_t* inputQueueArray[kMaxChannels];
++    const uint8_t channels;
++    bool active = false;
++    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f; // normalised (a0 = 1)
++    float z1[kMaxChannels] = { 0.0f, 0.0f };                       // transposed direct form II
++    float z2[kMaxChannels] = { 0.0f, 0.0f };
++};
++
++#endif /* MOD_SAMPLE_INSTRUMENT_FX */
++#endif /* LIBS_AUDIO_FILTER_DJ_H_ */
+diff --git a/core/source/mtStructs.h b/core/source/mtStructs.h
+index 64b002b..84c717b 100644
+--- a/core/source/mtStructs.h
++++ b/core/source/mtStructs.h
+@@ -41,7 +41,28 @@ const char firmwareVersionLabelFormat[] = "%d.%d.%d " FW_EDITION_NAME;
+ const char firmwareVersionLabelFormatBeta[] = "%d.%d.%d " FW_EDITION_NAME " beta %d";
+ 
+ const uint8_t PROJECT_FILE_VERSION = 17;   // wersja struktury pliku projektu
++// ---- opt-in mod flag derivations (identical block in every mod that extends strInstrument) ----
++#if defined(MOD_SAMPLE_INSTRUMENT_FX) || defined(MOD_PITCH_RANGE) || defined(MOD_LFO_POLARITY)
++#define MOD_INSTRUMENT_EXT
++#endif
++// Editor: Amount column hosts extra sub-parameters (LFO polarity, pitch semitone/cent depth).
++#if defined(MOD_PITCH_RANGE) || defined(MOD_LFO_POLARITY)
++#define MOD_AMOUNT_SUBPARAMS
++#endif
++// LFO output is produced in a canonical [-1,+1] form (amount applied afterwards) when signed depth
++// and/or polarity is enabled.
++#if defined(MOD_LFO_SIGNED_DEPTH) || defined(MOD_LFO_POLARITY)
++#define MOD_LFO_CANONICAL
++#endif
++#ifdef MOD_INSTRUMENT_EXT
++// Shared by the struct-extending mods (see features/CROSS_FEATURE.md): one fixed 8-byte block is
++// appended to strInstrument whenever ANY of them is enabled -> file version 10. Because the block
++// layout does not depend on which mods are on, files are interchangeable between mod builds.
++// NOTE: files saved with these mods are not readable by stock firmware.
++const uint8_t INSTRUMENT_FILE_VERSION = 10;
++#else
+ const uint8_t INSTRUMENT_FILE_VERSION = 9; // wersja struktury pliku instrumentu
++#endif
+ const uint8_t PATTERN_FILE_VERSION = 6;
+ 
+ const uint8_t CONFIG_STRUCT_VER = 10;
+@@ -247,6 +268,10 @@ constexpr uint32_t LFO_FINETUNE_SEND_MASK = 0b00000000000010000000000000000000;
+ constexpr uint32_t REVERB_SEND_MASK = 0b00000000000100000000000000000000;
+ constexpr uint32_t OVERDRIVE_MASK = 0b00000000001000000000000000000000;
+ constexpr uint32_t BIT_DEPTH_MASK = 0b00000000010000000000000000000000;
++#ifdef MOD_SAMPLE_INSTRUMENT_FX
++constexpr uint32_t SAMPLE_RATE_REDUCTION_MASK = 0b00000000100000000000000000000000;
++constexpr uint32_t DJ_FILTER_MASK = 0b00000001000000000000000000000000;
++#endif
+ 
+ const uint8_t MIN_NOTE_OFFSET = 0;
+ const uint8_t MAX_NOTE_OFFSET = 13;
+@@ -675,6 +700,15 @@ struct strInstrument
+     uint8_t overdrive;
+     uint8_t bitDepth; // = BIT_DEPTH_MAX;
+     int8_t tuneResample;
++#ifdef MOD_INSTRUMENT_EXT
++    // Shared mod extension block (file format v10), fixed layout. Neutral/legacy values below.
++    uint8_t sampleRateReduction; // MOD_SAMPLE_INSTRUMENT_FX: 0 = off .. 255
++    int8_t djFilter;             // MOD_SAMPLE_INSTRUMENT_FX: -100 .. 0 (off) .. +100
++    int8_t pitchModSemitones;    // MOD_PITCH_RANGE: -24 .. +24 (additive with cents)
++    int8_t pitchModCents;        // MOD_PITCH_RANGE: -100 .. +100; default +100 = legacy +-1 st
++    uint8_t lfoPolarityMask;     // MOD_LFO_POLARITY: bit n = LFO of envelope slot n unipolar
++    uint8_t modExtReserved[3];   // reserved, keep zero
++#endif
+ 
+     // Bitmasks for envelope[envWtPos / envGranLen].enable so legacy .pti files (which only ever
+     // set bit 0 = 0x01 for Wavetable Position) never unintendedly enable Granular Length automation.
+@@ -731,7 +765,12 @@ struct strInstrument
+         }
+     }
+ };
++#ifdef MOD_INSTRUMENT_EXT
++static_assert(sizeof(strInstrument) == 380,
++              "strInstrument with the mod extension block must be 380 bytes (372 + 8)");
++#else
+ static_assert(sizeof(strInstrument) == 372, "strInstrument size must remain 372 bytes");
++#endif
+ 
+ //----------------------------------------------------------------------------------
+ const strInstrument defaultInstrumentParams = {
+@@ -775,6 +814,14 @@ const strInstrument defaultInstrumentParams = {
+     .overdrive = 0,
+     .bitDepth = 16,
+     .tuneResample = 0,
++#ifdef MOD_INSTRUMENT_EXT
++    .sampleRateReduction = 0,
++    .djFilter = 0,
++    .pitchModSemitones = 0,
++    .pitchModCents = 100,
++    .lfoPolarityMask = 0,
++    .modExtReserved = { 0, 0, 0 },
++#endif
+ };
+ 
+ //----------------------------------------------------------------------------------

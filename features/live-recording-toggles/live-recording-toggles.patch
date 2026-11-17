@@ -1,0 +1,263 @@
+diff --git a/core/interface/patternEditor/fPatternEdit.cpp b/core/interface/patternEditor/fPatternEdit.cpp
+index 37fe898..f3a81f7 100644
+--- a/core/interface/patternEditor/fPatternEdit.cpp
++++ b/core/interface/patternEditor/fPatternEdit.cpp
+@@ -48,6 +48,10 @@ static void functPastePattern();
+ 
+ static void functNamePattern();
+ static void functNameTrack();
++#ifdef MOD_LIVE_REC_TOGGLES
++static void functToggleNoteOffDetection();
++static void functToggleRecMicrotiming();
++#endif
+ 
+ static void functClockWarningPopupButtons(uint8_t button, uint8_t state);
+ 
+@@ -5180,10 +5184,31 @@ void cPatternEditor::setActionButtonPage3Funct()
+ 
+     ip->setButtonObj(interfaceButton0, buttonPress, functNamePattern);
+     ip->setButtonObj(interfaceButton1, buttonPress, functNameTrack);
++    // slot 2 stays reserved (Master Timing Loop Multiplier)
++#ifdef MOD_LIVE_REC_TOGGLES
++    ip->setButtonObj(interfaceButton3, buttonPress, functToggleNoteOffDetection);
++    ip->setButtonObj(interfaceButton4, buttonPress, functToggleRecMicrotiming);
++#endif
+ 
+     ip->setButtonObj(interfaceButton7, buttonPress, functNextActionButtonPage);
+ }
+ 
++#ifdef MOD_LIVE_REC_TOGGLES
++// Global options for the *next* live recordings. Active recordings keep what they captured, so
++// these stay editable while recording / while notes are held. They only edit RAM state.
++static void functToggleNoteOffDetection()
++{
++    sequencer.setLiveRecNoteOffDetection(!sequencer.getLiveRecNoteOffDetection());
++    PTE->showActionButtonPage3Labels();
++}
++
++static void functToggleRecMicrotiming()
++{
++    sequencer.setLiveRecMicrotiming(!sequencer.getLiveRecMicrotiming());
++    PTE->showActionButtonPage3Labels();
++}
++#endif
++
+ // odsiwez przypisanie akcji oraz grafike przyciskow pod ekranem
+ void cPatternEditor::refreshActualActionButtonPage()
+ {
+diff --git a/core/interface/patternEditor/gPatternEdit.cpp b/core/interface/patternEditor/gPatternEdit.cpp
+index 623c6bd..841e86a 100644
+--- a/core/interface/patternEditor/gPatternEdit.cpp
++++ b/core/interface/patternEditor/gPatternEdit.cpp
+@@ -1598,6 +1598,17 @@ void cPatternEditor::showActionButtonPage3Labels()
+     display.setControlText2(label[6], "");
+     display.setControlText2(label[7], "");
+ 
++#ifdef MOD_LIVE_REC_TOGGLES
++    display.setControlText(label[3], "Note Off");
++    display.setControlText2(label[3], sequencer.getLiveRecNoteOffDetection() ? "ON" : "OFF");
++    display.setControlText(label[4], "Microtiming");
++    display.setControlText2(label[4], sequencer.getLiveRecMicrotiming() ? "ON" : "OFF");
++    display.setControlColors(label[3], display.getTheme().activeButtonLabelsColors);
++    display.setControlColors(label[4], display.getTheme().activeButtonLabelsColors);
++    display.setControlData(label[3], &labelDataGreen);
++    display.setControlData(label[4], &labelDataGreen);
++#endif
++
+     if (editMode)
+     {
+     }
+@@ -1620,7 +1631,11 @@ void cPatternEditor::showActionButtonPage3Labels()
+           label[i],
+           controlStyleCenterX | controlStyleCenterY | controlStyleFont3 | controlStyleShow |
+             (i == 7 ? controlStyleSpecialFx2
+-                    : (i < 2 ? (display.getTheme().patternEditorBottomButtonsLines
++                    : (i < 2
++#ifdef MOD_LIVE_REC_TOGGLES
++                           || i == 3 || i == 4
++#endif
++                         ? (display.getTheme().patternEditorBottomButtonsLines
+                                   ? controlStyleSpecialFx
+                                   : 0)
+                              : 0)));
+diff --git a/core/source/mtSequencer.cpp b/core/source/mtSequencer.cpp
+index f3d8c1d..03aa54e 100644
+--- a/core/source/mtSequencer.cpp
++++ b/core/source/mtSequencer.cpp
+@@ -2605,6 +2605,12 @@ uint8_t Sequencer::recMicrotiming()
+     return mtConfig.general.recOptions == recOptions_microtimingAndVelocity ||
+            mtConfig.general.recOptions == recOptions_microtiming;
+ }
++#ifdef MOD_LIVE_REC_TOGGLES
++bool Sequencer::getLiveRecMicrotiming()
++{
++    return liveRecMicrotimingOverride < 0 ? (recMicrotiming() != 0) : (liveRecMicrotimingOverride != 0);
++}
++#endif
+ uint8_t Sequencer::recVelocity()
+ {
+     return mtConfig.general.recOptions == recOptions_microtimingAndVelocity ||
+@@ -2688,6 +2694,12 @@ AUDIO_CORE_FLASH void Sequencer::handleNoteOn(
+         int8_t singleArmedTrack = getSingleArmedTrack();
+         int startTrack = (singleArmedTrack >= 0) ? singleArmedTrack : getActualTrack();
+         int endTrack = (singleArmedTrack >= 0) ? (singleArmedTrack + 1) : kAllTracks;
++#ifdef MOD_LIVE_REC_TOGGLES
++        // A source pressed while other sources are still held joins the open group: it keeps the
++        // settings captured when the group started.
++        const bool joinsOpenGroup = singleArmedTrack >= 0 && liveRecHeldNotesCount > 0 &&
++                                    player.track[singleArmedTrack].recOpen;
++#endif
+ 
+         if (singleArmedTrack >= 0)
+         {
+@@ -2729,7 +2741,19 @@ AUDIO_CORE_FLASH void Sequencer::handleNoteOn(
+ 
+         for (int tr = startTrack; tr < endTrack; tr++)
+         {
+-            uint8_t destinationStep = isAnticipatedBeat1 ? 0 : getDestRecordingStep(tr, !recMicrotiming());
++#ifdef MOD_LIVE_REC_TOGGLES
++            // Captured settings (join) or the current global options (new recording lifecycle).
++            // Only committed to the track once the note actually enters the recording path below.
++            const bool trMicro = (joinsOpenGroup && tr == singleArmedTrack)
++                                   ? player.track[tr].recCapMicrotiming
++                                   : getLiveRecMicrotiming();
++            const bool trNoteOff = (joinsOpenGroup && tr == singleArmedTrack)
++                                     ? player.track[tr].recCapNoteOff
++                                     : liveRecNoteOffDetection;
++#else
++            const bool trMicro = recMicrotiming();
++#endif
++            uint8_t destinationStep = isAnticipatedBeat1 ? 0 : getDestRecordingStep(tr, !trMicro);
+ 
+             strPattern::strTrack::strStep* step = &currentPattern->track[tr].step[destinationStep];
+ 
+@@ -2788,8 +2812,12 @@ AUDIO_CORE_FLASH void Sequencer::handleNoteOn(
+ 
+                     player.track[tr].recOpen = 1;
+                     player.track[tr].recNoteOnStepIdx = destinationStep;
++#ifdef MOD_LIVE_REC_TOGGLES
++                    player.track[tr].recCapMicrotiming = trMicro;
++                    player.track[tr].recCapNoteOff = trNoteOff;
++#endif
+ 
+-                    if (recMicrotiming())
++                    if (trMicro)
+                     {
+                         step->micromove =
+                           isAnticipatedBeat1
+@@ -3017,17 +3045,19 @@ void Sequencer::handleNoteOff(byte channel, // pochodzenie grida np. GRID_OUTSID
+ 
+                     if (wasRecOpen && !padInstrumentEdit && !player.preRecMetronomeActive)
+                     {
+-                        uint8_t destinationStep = getDestRecordingStep(tr, !recMicrotiming(), true);
++                        uint8_t destinationStep =
++                          getDestRecordingStep(tr, !recMicroFor(tr), true);
+                         strPattern::strTrack::strStep* step =
+                           &currentPattern->track[tr].step[destinationStep];
+ 
+-                        if (step->isNoteEmpty())
++                        // Only the pattern Note Off is gated; the preview release above already ran.
++                        if (recNoteOffFor(tr) && step->isNoteEmpty())
+                         {
+                             wasChangeInPattern = true;
+ 
+                             step->note = STEP_NOTE_OFF_DEFAULT;
+ 
+-                            if (recMicrotiming() && destinationStep == player.track[tr].actual_pos)
++                            if (recMicroFor(tr) && destinationStep == player.track[tr].actual_pos)
+                             {
+                                 step->micromove =
+                                   clamp<int>(mapClamped<int>(player.uStep, 1, 48, 0, 100),
+@@ -3044,7 +3074,7 @@ void Sequencer::handleNoteOff(byte channel, // pochodzenie grida np. GRID_OUTSID
+             liveRecHeldNotesCount = 0;
+             for (uint8_t tr = 0; tr < kAllTracks; tr++)
+             {
+-                uint8_t destinationStep = getDestRecordingStep(tr, !recMicrotiming(), true);
++                uint8_t destinationStep = getDestRecordingStep(tr, !recMicroFor(tr), true);
+                 bool shouldOff = (player.track[tr].recOpen || player.track[tr].noteOpen) &&
+                                  player.track[tr].stepSent.note == note;
+ 
+@@ -3092,13 +3122,14 @@ void Sequencer::handleNoteOff(byte channel, // pochodzenie grida np. GRID_OUTSID
+                         strPattern::strTrack::strStep* step =
+                           &currentPattern->track[tr].step[destinationStep];
+ 
+-                        if (step->isNoteEmpty())
++                        // Only the pattern Note Off is gated; the preview release above already ran.
++                        if (recNoteOffFor(tr) && step->isNoteEmpty())
+                         {
+                             wasChangeInPattern = true;
+ 
+                             step->note = STEP_NOTE_OFF_DEFAULT;
+ 
+-                            if (recMicrotiming() && destinationStep == player.track[tr].actual_pos)
++                            if (recMicroFor(tr) && destinationStep == player.track[tr].actual_pos)
+                             {
+                                 step->micromove =
+                                   clamp<int>(mapClamped<int>(player.uStep, 1, 48, 0, 100),
+diff --git a/core/source/mtSequencer.h b/core/source/mtSequencer.h
+index 37bdadd..5634673 100644
+--- a/core/source/mtSequencer.h
++++ b/core/source/mtSequencer.h
+@@ -455,6 +455,13 @@ class Sequencer
+             bool noteOpen = 0;
+             uint8_t recOpen = 0;
+             uint8_t recNoteOnStepIdx = 0;
++#ifdef MOD_LIVE_REC_TOGGLES
++            // Captured when this track's live-recording lifecycle starts (see
++            // features/live-recording-toggles). Only meaningful while recOpen != 0; never read
++            // from the global toggles once captured.
++            bool recCapMicrotiming = true;
++            bool recCapNoteOff = true;
++#endif
+ 
+             int16_t noteSource = -1;
+ 
+@@ -940,6 +947,14 @@ class Sequencer
+         player.preRollMetronomeEndCalback = preRollMetronomeEndCalback;
+     };
+ 
++#ifdef MOD_LIVE_REC_TOGGLES
++    // Pattern Editor controls. Changing these never affects a note that is already being recorded.
++    bool getLiveRecNoteOffDetection() const { return liveRecNoteOffDetection; }
++    void setLiveRecNoteOffDetection(bool on) { liveRecNoteOffDetection = on; }
++    bool getLiveRecMicrotiming();
++    void setLiveRecMicrotiming(bool on) { liveRecMicrotimingOverride = on ? 1 : 0; }
++#endif
++
+   private:
+     static constexpr int kTicksInStep = 576;
+     static constexpr size_t kExternalTempoCounterSize = 24 * 2;
+@@ -1018,7 +1033,33 @@ class Sequencer
+ 
+     uint8_t recMicrotiming();
+     uint8_t recVelocity();
++#ifdef MOD_LIVE_REC_TOGGLES
++    // Global runtime options for *new* live recordings (RAM only, not saved).
++    // Microtiming follows the config's recOptions until the user overrides it.
++    int8_t liveRecMicrotimingOverride = -1; // -1 = follow recOptions, 0 = OFF, 1 = ON
++    bool liveRecNoteOffDetection = true;
++#endif
+     uint8_t getDestRecordingStep(uint8_t track, bool quantize, bool noteOff = false);
++    // Settings an *active* recording on this track must use (captured at its start). Without the
++    // mod these are exactly the stock behaviour.
++    bool recMicroFor(uint8_t track)
++    {
++#ifdef MOD_LIVE_REC_TOGGLES
++        return player.track[track].recCapMicrotiming;
++#else
++        (void)track;
++        return recMicrotiming();
++#endif
++    }
++    bool recNoteOffFor(uint8_t track)
++    {
++#ifdef MOD_LIVE_REC_TOGGLES
++        return player.track[track].recCapNoteOff;
++#else
++        (void)track;
++        return true;
++#endif
++    }
+ 
+     uint8_t getNextArpNote(strPlayer::strPlayerTrack* playerRow);
+ 

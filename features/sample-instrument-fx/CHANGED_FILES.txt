@@ -1,0 +1,17 @@
+M	core/AudioEngine/AudioVoice.cpp
+M	core/AudioEngine/AudioVoice.h
+M	core/AudioEngine/mtAudioEngine.cpp
+M	core/AudioEngine/mtAudioEngine.h
+M	core/AudioEngine/mtAudioNoteOnHandle.cpp
+M	core/AudioEngine/mtAudioUpdateHandle.cpp
+M	core/FileManager/fileManagerInstrument.cpp
+M	core/FileManager/mtFileManagerOldVersionRecovery.cpp
+M	core/interface/instrumentEditor/fIinstrEdit.cpp
+M	core/interface/instrumentEditor/gInstrEdit.cpp
+M	core/interface/instrumentEditor/instrumentEditor.h
+M	core/libs/Audio/Audio.h
+A	core/libs/Audio/effect_sampleRateReduction.cpp
+A	core/libs/Audio/effect_sampleRateReduction.h
+A	core/libs/Audio/filter_dj.cpp
+A	core/libs/Audio/filter_dj.h
+M	core/source/mtStructs.h

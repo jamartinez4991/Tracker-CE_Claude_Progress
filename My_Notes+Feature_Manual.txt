@@ -1,0 +1,18 @@
+Modulation Changes:
+-All LFOs now have bipolar depth.
+-All LFOs have a Bipolar/Unipolar switch accessed by tapping Amount a second time. 
+-Under Finetune, modulation depth can now be set to a depth of +/- 24 semitones, the extra options are reached by pressing Amount additional times, past the Unipolar switch.
+
+"Lazy" Chop in Slice Modes:
+-When holding an instrument pad to preview the sample, you can tap Add where you would like to be as many times as you want. When the pad is released, the new slices are populated. Still limited to 48 total slices, slices beyond 48 are discarded. 
+
+Additional Instrument Parameters:
+-Sample instruments now have samplerate reduction and an additional non-resonant HP/LP filter in the second page of Instrument parameters.
+
+Toggles for Note Off Detection and Microtiming Selection during Live Recording:
+-NOTE: Make sure to disarm the Midi/Synth tracks for live recording unless you intend to use them.
+-Toggles on the last page of Pattern options. Independent toggles to determine if Note Off events or Microtiming are captured during Live Recoding. 
+
+For Plus/Mini, Stereo/Mono Sampling Switch:
+-BUG: The Format value doesn't show which mode you are in, but it does function.
+-In the Sample Recorder, underneath the Level VU meter the option Format is now present. Pressing it will toggle between stereo sampling and mono sampling. 

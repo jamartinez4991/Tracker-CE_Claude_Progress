@@ -1,0 +1,4 @@
+M	core/interface/patternEditor/fPatternEdit.cpp
+M	core/interface/patternEditor/gPatternEdit.cpp
+M	core/source/mtSequencer.cpp
+M	core/source/mtSequencer.h

@@ -1,0 +1,4 @@
+M	core/interface/projectEditor/fProjEdit.cpp
+M	core/interface/sampleRecorder/fSampleRec.cpp
+M	core/interface/sampleRecorder/gSampleRec.cpp
+M	core/interface/sampleRecorder/sampleRecorder.h

@@ -1,0 +1,554 @@
+diff --git a/core/AudioEngine/VoiceStreamManager.cpp b/core/AudioEngine/VoiceStreamManager.cpp
+index fc9bc35..3686c8c 100644
+--- a/core/AudioEngine/VoiceStreamManager.cpp
++++ b/core/AudioEngine/VoiceStreamManager.cpp
+@@ -1722,12 +1722,56 @@ void VoiceStreamManager::setSuspended(bool suspended)
+     }
+ }
+ 
++#ifdef MOD_LAZY_CHOP
++void VoiceStreamManager::requestInstrumentSliceCacheRefresh(int instrIdx)
++{
++    if (instrIdx < 0 || instrIdx >= kMaxInstruments)
++        return;
++    pendingSliceCacheRefresh |= (1ULL << instrIdx);
++}
++
++void VoiceStreamManager::servicePendingSliceCacheRefresh()
++{
++    if (pendingSliceCacheRefresh == 0)
++        return;
++
++    // Conservative: no outstanding async job at all (it may target a shared ring buffer) and no
++    // asynchronous SD read in flight.
++    if (currentJob.inProgress || fs->isAsyncReadBusy())
++        return;
++
++    for (int instr = 0; instr < kMaxInstruments; instr++)
++    {
++        if (!(pendingSliceCacheRefresh & (1ULL << instr)))
++            continue;
++
++        bool inUse = false;
++        for (int v = 0; v < kVoiceCount; v++)
++        {
++            if (voices[v].active && voices[v].instrIdx == instr)
++            {
++                inUse = true;
++                break;
++            }
++        }
++        if (inUse)
++            continue;
++
++        pendingSliceCacheRefresh &= ~(1ULL << instr);
++        refreshInstrumentSliceCache(instr);
++    }
++}
++#endif
++
+ void VoiceStreamManager::update()
+ {
+     if (fs == nullptr || isSuspended)
+     {
+         return;
+     }
++#ifdef MOD_LAZY_CHOP
++    servicePendingSliceCacheRefresh();
++#endif
+ 
+     if (currentJob.inProgress)
+     {
+diff --git a/core/AudioEngine/VoiceStreamManager.h b/core/AudioEngine/VoiceStreamManager.h
+index faddb10..1858840 100644
+--- a/core/AudioEngine/VoiceStreamManager.h
++++ b/core/AudioEngine/VoiceStreamManager.h
+@@ -91,6 +91,11 @@ class VoiceStreamManager
+     // For after the card was remounted: the files may have moved on it.
+     void rebindAllInstrumentStreamFiles();
+     void refreshInstrumentSliceCache(int instrIdx);
++#ifdef MOD_LAZY_CHOP
++    // Deferred variant: remembered, then executed from update() once no voice reads the instrument
++    // and no asynchronous SD read is outstanding. Safe to call repeatedly.
++    void requestInstrumentSliceCacheRefresh(int instrIdx);
++#endif
+     void refreshInstrumentSingleSliceCache(int instrIdx, uint8_t sliceIdx);
+ 
+     // Blocking read of arbitrary frame range from a streamed instrument's backing file
+@@ -159,6 +164,10 @@ class VoiceStreamManager
+         uint32_t expectedGeneration = 0;
+     };
+ 
++#ifdef MOD_LAZY_CHOP
++    uint64_t pendingSliceCacheRefresh = 0; // bit per instrument (kMaxInstruments = 48)
++    void servicePendingSliceCacheRefresh();
++#endif
+     FileSystem* fs = nullptr;
+     VoiceStreamState voices[kVoiceCount];
+     AsyncJob currentJob;
+diff --git a/core/AudioEngine/mtAudioEngine.cpp b/core/AudioEngine/mtAudioEngine.cpp
+index 4d59561..d577ffc 100644
+--- a/core/AudioEngine/mtAudioEngine.cpp
++++ b/core/AudioEngine/mtAudioEngine.cpp
+@@ -2207,6 +2207,18 @@ uint16_t playerEngine ::getWavePosition()
+       ->getPosition(); // should be the same for all channels, so returned the first one
+ }
+ 
++#ifdef MOD_LAZY_CHOP
++bool playerEngine ::isSamplePlaying()
++{
++    return playMemPtr[0]->isPlaying();
++}
++
++bool playerEngine ::isSampleReversed()
++{
++    return playMemPtr[0]->isReverse();
++}
++#endif
++
+ int16_t* playerEngine ::getWaveStartAddressIfPlaying(int channel)
+ {
+     return playMemPtr[channel]->getStartAddresIfPlaying();
+diff --git a/core/AudioEngine/mtAudioEngine.h b/core/AudioEngine/mtAudioEngine.h
+index 8d04081..dc45673 100644
+--- a/core/AudioEngine/mtAudioEngine.h
++++ b/core/AudioEngine/mtAudioEngine.h
+@@ -332,6 +332,11 @@ class playerEngine
+     uint32_t getEnvelopeWtPosMod();
+ 
+     uint16_t getWavePosition();
++#ifdef MOD_LAZY_CHOP
++    // Per-voice, read-only queries used by Lazy Chop (never call getWavePosition() unless playing).
++    bool isSamplePlaying();
++    bool isSampleReversed();
++#endif
+     int16_t* getWaveStartAddressIfPlaying(int channel);
+     uint32_t getLengthIfPlaying();
+     void update();
+diff --git a/core/interface/samplePlayback/fSamplePlay.cpp b/core/interface/samplePlayback/fSamplePlay.cpp
+index 23b14c5..0d646bd 100644
+--- a/core/interface/samplePlayback/fSamplePlay.cpp
++++ b/core/interface/samplePlayback/fSamplePlay.cpp
+@@ -85,8 +85,156 @@ static void modGranularLoopType(int16_t value);
+ 
+ constexpr uint32_t PLAY_REFRESH_US = 5000;
+ 
++#ifdef MOD_LAZY_CHOP
++// A session is bound to one voice, one note source and one instrument.
++bool cSamplePlayback::lazyChopBindingValid()
++{
++    if (!lazyChop.active || lazyChop.voiceIndex >= 8)
++        return false;
++
++    int16_t src = -1;
++    uint8_t instr = 0;
++    if (!sequencer.getManualNoteBinding(lazyChop.voiceIndex, src, instr))
++        return false;
++    if (src != lazyChop.noteSource || instr != lazyChop.instrumentIndex)
++        return false;
++
++    return instrumentPlayer[lazyChop.voiceIndex].isSamplePlaying();
++}
++
++// Called right after sequencer.handleNoteOn(). Verifies the real sequencer/engine state instead of
++// trusting getLastUsedVoice() alone.
++void cSamplePlayback::lazyChopTryStart(int16_t source)
++{
++    if (lazyChop.active) // never silently replace a running session
++        return;
++    if (mtProject.values.lastUsedInstrument >= kSampleInstrumentsCount || editorInstrument == nullptr)
++        return;
++
++    const strInstrument& instr = mtProject.instrument[mtProject.values.lastUsedInstrument];
++    if (instr.playMode != playModeSlice && instr.playMode != playModeBeatSlice)
++        return;
++    if (sliceScreenMode2)
++        return;
++
++    const uint8_t voice = engine.getLastUsedVoice();
++    if (voice >= 8)
++        return;
++
++    int16_t src = -1;
++    uint8_t seqInstr = 0;
++    if (!sequencer.getManualNoteBinding(voice, src, seqInstr))
++        return;
++    if (src != source || seqInstr != mtProject.values.lastUsedInstrument)
++        return;
++    if (!instrumentPlayer[voice].isSamplePlaying() || instrumentPlayer[voice].isSampleReversed())
++        return;
++
++    lazyChop = LazyChopSession();
++    lazyChop.active = true;
++    lazyChop.voiceIndex = voice;
++    lazyChop.instrumentIndex = mtProject.values.lastUsedInstrument;
++    lazyChop.noteSource = source;
++}
++
++// Add control while a session is active: remember the position, change nothing else.
++bool cSamplePlayback::lazyChopTryCapture()
++{
++    if (!lazyChop.active || lazyChop.finalizing)
++        return false;
++
++    if (!lazyChopBindingValid())
++    {
++        lazyChopFinalize();
++        return false; // session over: ordinary midpoint Add applies
++    }
++
++    if (instrumentPlayer[lazyChop.voiceIndex].isSampleReversed())
++        return true; // reverse: reject capture, but don't fall through to midpoint Add
++
++    const strInstrument& instr = mtProject.instrument[lazyChop.instrumentIndex];
++    const uint16_t pos = instrumentPlayer[lazyChop.voiceIndex].getWavePosition();
++
++    // Capacity: existing boundaries (a zero boundary counts when the table is empty) + pending.
++    const uint8_t existing = instr.sliceNumber == 0 ? 1 : instr.sliceNumber;
++    if (existing + lazyChop.pendingCount >= MAX_SLICE_NUMBER)
++        return true;
++
++    for (uint8_t i = 0; i < lazyChop.pendingCount; i++)
++    {
++        if (lazyChop.pendingPositions[i] == pos) // exact duplicate
++            return true;
++    }
++
++    lazyChop.pendingPositions[lazyChop.pendingCount++] = pos;
++    return true;
++}
++
++void cSamplePlayback::lazyChopOnNoteOff(int16_t source)
++{
++    if (lazyChop.active && lazyChop.noteSource == source)
++        lazyChopFinalize();
++}
++
++// Natural end, explicit cut / voice replacement, instrument change.
++void cSamplePlayback::lazyChopUpdate()
++{
++    if (!lazyChop.active || lazyChop.finalizing)
++        return;
++
++    if (mtProject.values.lastUsedInstrument != lazyChop.instrumentIndex || !lazyChopBindingValid())
++    {
++        lazyChopFinalize();
++    }
++}
++
++// Idempotent. Always commits to the instrument recorded at session start.
++void cSamplePlayback::lazyChopFinalize(bool refreshUi)
++{
++    if (!lazyChop.active || lazyChop.finalizing)
++        return;
++    lazyChop.finalizing = true;
++
++    const uint8_t instrIdx = lazyChop.instrumentIndex;
++    if (lazyChop.pendingCount > 0 && instrIdx < kSampleInstrumentsCount)
++    {
++        strInstrument* instr = &mtProject.instrument[instrIdx];
++        const uint8_t inserted =
++          sliceManager.insertSlicesAtPositions(instr, lazyChop.pendingPositions, lazyChop.pendingCount);
++
++        if (inserted > 0)
++        {
++            if (mtProject.sampleMemory[instrIdx].isStreamed)
++            {
++                // Never rebuild while a voice may be reading the shared buffers.
++                voiceStreamManager.requestInstrumentSliceCacheRefresh(instrIdx);
++            }
++
++            newFileManager.setInstrumentStructChanged(instrIdx);
++
++            if (refreshUi && instr == editorInstrument && moduleRefresh)
++            {
++                zoom.zoomPosition = instr->slices[instr->selectedSlice];
++                if ((zoom.zoomPosition > zoom.zoomEnd) || (zoom.zoomPosition < zoom.zoomStart))
++                {
++                    refreshSpectrum = 1;
++                }
++                showSlicesSelectValue();
++                showSlicesAdjustValue();
++                refreshSlicePoints = 1;
++            }
++        }
++    }
++
++    lazyChop = LazyChopSession(); // cleared only after the commit has completed
++}
++#endif
++
+ void cSamplePlayback::update()
+ {
++#ifdef MOD_LAZY_CHOP
++    lazyChopUpdate();
++#endif
+     refreshLiveParams();
+ 
+     // A MIDI or synth instrument has no waveform; the request waits for a sample instrument.
+@@ -336,6 +484,9 @@ void cSamplePlayback::stop()
+         mtPopups.toggleNoteKeyboardPopup();
+     }
+ 
++#ifdef MOD_LAZY_CHOP
++    lazyChopFinalize(false); // before cleanup invalidates the note-source association
++#endif
+     sequencer.stopManualNotes();
+     sequencer.setMidiInVoiceMode(Sequencer::midiInVoiceMode_default);
+     moduleRefresh = 0;
+@@ -600,6 +751,9 @@ void cSamplePlayback::onEndTrackDisplay()
+ void cSamplePlayback::noteOnHandle(uint8_t channel, uint8_t note, uint8_t velocity, int16_t source)
+ {
+     sequencer.handleNoteOn(channel, note, velocity, source);
++#ifdef MOD_LAZY_CHOP
++    lazyChopTryStart(source);
++#endif
+ 
+     if (displayedTrack == engine.getLastUsedVoice())
+     {
+@@ -619,6 +773,9 @@ void cSamplePlayback::noteOffHandle(uint8_t channel, uint8_t note, uint8_t veloc
+ {
+     (void)velocity;
+     sequencer.handleNoteOff(channel, note, 0, source);
++#ifdef MOD_LAZY_CHOP
++    lazyChopOnNoteOff(source);
++#endif
+ }
+ 
+ void cSamplePlayback::lightUpPadBoard()
+@@ -1133,6 +1290,9 @@ static void functButton5()
+     else if (SP->editorInstrument->playMode == playModeBeatSlice ||
+              SP->editorInstrument->playMode == playModeSlice)
+     {
++#ifdef MOD_LAZY_CHOP
++        SP->lazyChopFinalize(); // before the Add controls change meaning
++#endif
+         SP->sliceScreenMode2 = !SP->sliceScreenMode2;
+ 
+         if (!SP->sliceScreenMode2)
+@@ -1741,6 +1901,9 @@ static void functPlayAction()
+ 
+     if (sequencer.getSeqState() == Sequencer::SEQ_STATE_STOP)
+     {
++#ifdef MOD_LAZY_CHOP
++        SP->lazyChopFinalize(); // before the voices are cut
++#endif
+         for (uint8_t i = 0; i < 8; i++)
+         {
+             instrumentPlayer[i].noteOff(Sequencer::STEP_NOTE_OFF_CUT); // POTRZEBNE TO TU? xxx
+@@ -1784,6 +1947,9 @@ static void changeZoom(int16_t value)
+ 
+ static void changePlayModeSelection(int16_t value)
+ {
++#ifdef MOD_LAZY_CHOP
++    SP->lazyChopFinalize(); // before the cut and any cache operation
++#endif
+     if (SP->isPlayingSample)
+     {
+         mtPadBoard.cutAllInstrument();
+@@ -2331,6 +2497,10 @@ static void modSliceAdjust(int16_t value)
+ 
+ static void functAddSlice()
+ {
++#ifdef MOD_LAZY_CHOP
++    if (SP->lazyChopTryCapture()) // active Lazy Chop session: capture instead of midpoint Add
++        return;
++#endif
+     sliceManager.addSlice(SP->editorInstrument);
+     if (mtProject.values.lastUsedInstrument < kSampleInstrumentsCount &&
+         mtProject.sampleMemory[mtProject.values.lastUsedInstrument].isStreamed)
+diff --git a/core/interface/samplePlayback/samplePlayback.h b/core/interface/samplePlayback/samplePlayback.h
+index bbfc425..76da075 100644
+--- a/core/interface/samplePlayback/samplePlayback.h
++++ b/core/interface/samplePlayback/samplePlayback.h
+@@ -182,6 +182,27 @@ class cSamplePlayback : public ModuleBase
+     float playPitch = 1.0;
+     bool sliceScreenMode2;
+     int8_t displayedTrack = -1;
++#ifdef MOD_LAZY_CHOP
++    // ---- Lazy Chop (see features/lazy-chop) ----
++    // Own session identity: independent of displayedTrack / display-end flags.
++    struct LazyChopSession
++    {
++        bool active = false;
++        bool finalizing = false;
++        uint8_t voiceIndex = 0;      // sequencer track == playerEngine index
++        uint8_t instrumentIndex = 0; // commit target, fixed at session start
++        int16_t noteSource = -1;     // pad number / 12 / INTERFACE_BUTTON_PREVIEW
++        uint16_t pendingPositions[MAX_SLICE_NUMBER];
++        uint8_t pendingCount = 0;
++    } lazyChop;
++
++    void lazyChopTryStart(int16_t source);
++    bool lazyChopTryCapture();     // true = Add press consumed by an active session
++    void lazyChopOnNoteOff(int16_t source);
++    void lazyChopUpdate();         // natural end / cut / instrument change detection
++    void lazyChopFinalize(bool refreshUi = true);
++    bool lazyChopBindingValid();
++#endif
+ 
+     strInstrument* editorInstrument = nullptr;
+     uint32_t lastSampleLength = 0xFFFFFFFF;
+diff --git a/core/libs/Audio/play_memory.h b/core/libs/Audio/play_memory.h
+index 412005b..63d0114 100644
+--- a/core/libs/Audio/play_memory.h
++++ b/core/libs/Audio/play_memory.h
+@@ -127,6 +127,9 @@ class AudioPlayMemory : public AudioStream
+     //************Reverse
+     void setReverse();
+     void clearReverse();
++#ifdef MOD_LAZY_CHOP
++    bool isReverse() const { return reverseDirectionFlag != 0; } // read-only (Lazy Chop)
++#endif
+     //*********
+     //************Pitch
+     // Tune
+diff --git a/core/source/mtSequencer.cpp b/core/source/mtSequencer.cpp
+index f3d8c1d..ae69be3 100644
+--- a/core/source/mtSequencer.cpp
++++ b/core/source/mtSequencer.cpp
+@@ -3152,6 +3152,17 @@ void Sequencer::handleNoteOff(byte channel, // pochodzenie grida np. GRID_OUTSID
+     }
+ }
+ 
++#ifdef MOD_LAZY_CHOP
++bool Sequencer::getManualNoteBinding(uint8_t track, int16_t& source, uint8_t& instrument) const
++{
++    if (track >= kAllTracks || !player.track[track].noteOpen)
++        return false;
++    source = player.track[track].noteSource;
++    instrument = (uint8_t)player.track[track].stepSent.instrument;
++    return true;
++}
++#endif
++
+ void Sequencer::updateTrackLengths(strPattern* pattern)
+ {
+     for (int trackIdx = 0; trackIdx < kAllTracks; trackIdx++)
+diff --git a/core/source/mtSequencer.h b/core/source/mtSequencer.h
+index 37bdadd..ecb836f 100644
+--- a/core/source/mtSequencer.h
++++ b/core/source/mtSequencer.h
+@@ -766,6 +766,10 @@ class Sequencer
+     void recEnable(bool enable);
+     void stop(void);
+     void stopManualNotes(void);
++#ifdef MOD_LAZY_CHOP
++    // True when `track` holds an open manual (preview) note; reports its source and instrument.
++    bool getManualNoteBinding(uint8_t track, int16_t& source, uint8_t& instrument) const;
++#endif
+     void continueSong(uint8_t songPos);
+     void loopCurrentPattern(uint8_t songPos);
+     int16_t findSlotWithPattern();
+diff --git a/core/source/mtSliceManager.cpp b/core/source/mtSliceManager.cpp
+index de62f06..f2c4ad0 100644
+--- a/core/source/mtSliceManager.cpp
++++ b/core/source/mtSliceManager.cpp
+@@ -40,6 +40,89 @@ void mtSliceManager::addSlice(strInstrument* instr)
+ 
+     instr->sliceNumber++;
+ }
++#ifdef MOD_LAZY_CHOP
++uint8_t mtSliceManager::insertSlicesAtPositions(strInstrument* instr,
++                                                const uint16_t* positions,
++                                                uint8_t count)
++{
++    if (instr == nullptr || positions == nullptr || count == 0)
++        return 0;
++    if (instr->sliceNumber > MAX_SLICE_NUMBER)
++        return 0;
++
++    uint16_t sorted[MAX_SLICE_NUMBER];
++    if (count > MAX_SLICE_NUMBER)
++        count = MAX_SLICE_NUMBER;
++    for (uint8_t i = 0; i < count; i++) // insertion sort (<= 48 entries)
++    {
++        uint16_t v = positions[i];
++        int8_t j = (int8_t)i - 1;
++        while (j >= 0 && sorted[j] > v)
++        {
++            sorted[j + 1] = sorted[j];
++            j--;
++        }
++        sorted[j + 1] = v;
++    }
++
++    // Work on a copy so the instrument is only touched when something is really inserted.
++    uint16_t merged[MAX_SLICE_NUMBER];
++    uint8_t n = 0;
++    if (instr->sliceNumber == 0)
++    {
++        merged[n++] = 0; // the zero boundary is not a captured marker
++    }
++    else
++    {
++        for (uint8_t i = 0; i < instr->sliceNumber; i++)
++            merged[n++] = instr->slices[i];
++    }
++
++    uint8_t inserted = 0;
++    uint16_t lastInserted = 0;
++    for (uint8_t i = 0; i < count; i++)
++    {
++        const uint16_t p = sorted[i];
++        if (p >= MAX_16BIT) // the sample end is not a valid slice start
++            continue;
++        if (n >= MAX_SLICE_NUMBER)
++            break;
++
++        uint8_t pos = 0;
++        bool duplicate = false;
++        while (pos < n && merged[pos] < p)
++            pos++;
++        if (pos < n && merged[pos] == p)
++            duplicate = true;
++        if (duplicate)
++            continue;
++
++        for (uint8_t k = n; k > pos; k--)
++            merged[k] = merged[k - 1];
++        merged[pos] = p;
++        n++;
++        inserted++;
++        lastInserted = p;
++    }
++
++    if (inserted == 0)
++        return 0;
++
++    for (uint8_t i = 0; i < n; i++)
++        instr->slices[i] = merged[i];
++    instr->sliceNumber = n;
++    for (uint8_t i = 0; i < n; i++)
++    {
++        if (merged[i] == lastInserted)
++        {
++            instr->selectedSlice = i;
++            break;
++        }
++    }
++    return inserted;
++}
++#endif
++
+ void mtSliceManager::removeSlice(strInstrument* instr)
+ {
+     if ((instr->sliceNumber == 0) || (instr->sliceNumber <= instr->selectedSlice))
+diff --git a/core/source/mtSliceManager.h b/core/source/mtSliceManager.h
+index 8aa8e1c..99e5d08 100644
+--- a/core/source/mtSliceManager.h
++++ b/core/source/mtSliceManager.h
+@@ -6,6 +6,13 @@ class mtSliceManager
+ {
+   public:
+     void addSlice(strInstrument* instr);
++#ifdef MOD_LAZY_CHOP
++    // Explicit-position batch insert (normalised 0..65534 positions). Sorts, drops exact duplicates
++    // (inside the batch and against existing boundaries), honours MAX_SLICE_NUMBER, keeps all existing
++    // boundaries. Selects the last inserted boundary. Returns the number inserted (0 = instrument
++    // untouched, including no zero boundary created).
++    uint8_t insertSlicesAtPositions(strInstrument* instr, const uint16_t* positions, uint8_t count);
++#endif
+     void removeSlice(strInstrument* instr);
+     void adjustSlice(strInstrument* instr, int32_t val);
+     void autoSlice(strInstrument* instr);

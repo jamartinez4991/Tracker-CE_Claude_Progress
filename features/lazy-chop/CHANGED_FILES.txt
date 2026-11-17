@@ -1,0 +1,11 @@
+M	core/AudioEngine/VoiceStreamManager.cpp
+M	core/AudioEngine/VoiceStreamManager.h
+M	core/AudioEngine/mtAudioEngine.cpp
+M	core/AudioEngine/mtAudioEngine.h
+M	core/interface/samplePlayback/fSamplePlay.cpp
+M	core/interface/samplePlayback/samplePlayback.h
+M	core/libs/Audio/play_memory.h
+M	core/source/mtSequencer.cpp
+M	core/source/mtSequencer.h
+M	core/source/mtSliceManager.cpp
+M	core/source/mtSliceManager.h
